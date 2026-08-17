@@ -1,0 +1,16 @@
+# 运行时依赖
+# 注意: 宇树 SDK 与 cyclonedds 在 Jetson Nano 自带环境 (Python 3.8) 上需要从源码安装
+# 见 docs/DEPLOY.md
+
+# 核心
+numpy>=1.21,<2.0
+opencv-python>=4.8
+PyYAML>=6.0
+
+# 视觉
+# MediaPipe 0.10+ 在 arm64 Linux 上需要 mediapipe-runtime（无 GUI 依赖）
+# Jetson Nano (Ubuntu 20.04 / aarch64) 建议 0.10.18
+mediapipe>=0.10.18
+
+# 宇树 SDK（源码安装；这里仅占位）
+# pip3 install -e /opt/unitree_sdk2_python

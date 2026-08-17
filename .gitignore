@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 输出
+logs/
+*.log
+*.mp4
+*.jpg
+*.png
+!docs/*.png
+
+# 部署
+deploy/
+*.tar.gz
+
+# SDK
+/unitree_sdk2_python/
+/cyclonedds/

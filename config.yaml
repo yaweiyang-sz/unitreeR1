@@ -1,0 +1,60 @@
+# =====================================================
+#  Unitree R1 EDU 控制系统全局配置
+# =====================================================
+
+robot:
+  # 网络接口名（Jetson Nano 与 R1 通过网线直连时的网卡名）
+  # 实际名以 `ip a` 看到的为准，常见: eth0, enp0s3, eno1
+  network_interface: "eth0"
+  # 机器人机载 PC2 (Jetson Nano) IP，调试用
+  onboard_pc_ip: "192.168.123.164"
+
+# 手势识别
+gesture:
+  enabled: true
+  # 连续 N 帧识别到同一手势才生效（防抖）
+  debounce_frames: 6
+  # 每帧最大处理时间 (ms)，超时则跳过
+  max_inference_ms: 80
+
+# 人体跟随
+follow:
+  enabled: false
+  # 目标水平偏移 (px)，保持在画面中心
+  target_center_x: 320        # 640 宽画面的中心
+  # 目标面积 (像素²)，对应保持距离
+  target_bbox_area: 50000
+  # 距离/方向 P 控制增益
+  kp_yaw: 0.0025              # 横向偏差 -> 角速度
+  kp_distance: 0.00004        # 面积偏差 -> 线速度
+  # 安全边界
+  max_linear_speed: 0.3       # m/s
+  max_angular_speed: 0.5      # rad/s
+  deadzone_yaw: 30            # 中心 ±30px 不动
+  deadzone_area: 8000         # 面积 ±8000px² 不动
+
+# 视野显示
+viewer:
+  # 是否显示本地 OpenCV 窗口（Jetson Nano 上若没有显示器可关）
+  opencv_window: true
+  # 是否启动 Web 预览（局域网内浏览器看机器人的视野）
+  web_stream: true
+  web_port: 8080
+  # 在画面上叠加的 UI
+  show_gesture_label: true
+  show_follow_target: true
+  show_telemetry: true
+
+# 主控
+control:
+  loop_hz: 30                 # 主循环频率
+  # 自动从手势切到跟随的触发（张开手掌持续 1 秒）
+  gesture_to_follow_hold_sec: 1.0
+  # 急停命令 (z=stop)，按键盘 'q' 或机器人按钮
+  emergency_stop_key: "q"
+  # 转向方向符号: +1 默认 (你站机器人后方), -1 翻转 (你面对机器人)
+  turn_direction_sign: 1
+  # 默认速度 (m/s, rad/s)
+  forward_speed: 0.3
+  backward_speed: -0.2
+  turn_speed: 0.5
