@@ -56,6 +56,7 @@ from src.vision.overlays import (
     draw_gesture_label,
     draw_gesture_legend,
     draw_hand_state,
+    draw_roi,
     draw_telemetry,
 )
 
@@ -201,8 +202,21 @@ def main() -> int:
         else:
             log.info("[safe-mode] 不进入 locomotion, 机器人将停在 Stance, 等你手势触发切 FSM")
 
-        # 视觉模块
-        gesture_det = HandGestureDetector()
+        # 视觉模块 (带 ROI + 大小过滤)
+        roi_pcts = (
+            get(cfg, "gesture.roi.x_pct", 0.20),
+            get(cfg, "gesture.roi.y_pct", 0.10),
+            get(cfg, "gesture.roi.w_pct", 0.60),
+            get(cfg, "gesture.roi.h_pct", 0.80),
+        )
+        gesture_det = HandGestureDetector(
+            roi_x_pct=roi_pcts[0],
+            roi_y_pct=roi_pcts[1],
+            roi_w_pct=roi_pcts[2],
+            roi_h_pct=roi_pcts[3],
+            min_hand_area_pct=get(cfg, "gesture.min_hand_area_pct", 3.0),
+            max_hand_area_pct=get(cfg, "gesture.max_hand_area_pct", 50.0),
+        )
         debouncer = GestureDebouncer(debounce_frames=get(cfg, "gesture.debounce_frames", 6))
 
         # 视频源
@@ -246,6 +260,9 @@ def main() -> int:
                          f"stable={stable.value}  → {result}")
 
             # 4) UI overlay
+            #    先画 ROI 框 (背景), 再画手势 label (前景)
+            hand_pos = gr.hand_center if gr else None
+            draw_roi(frame, roi_pcts, hand_pos=hand_pos, in_roi=(gr is not None))
             draw_gesture_label(frame, gr, stable=stable)
             draw_hand_state(frame, gr)
             draw_gesture_legend(frame)
@@ -262,6 +279,7 @@ def main() -> int:
                 "iface": iface,
                 "dry": "yes" if robot.is_dry_run else "no",
                 "loco": "on" if will_enter_loco else "off",
+                "hand": f"{gr.hand_area_pct:5.1f}%" if gr else "  -  ",
                 "last": last_action or "-",
             }
             draw_telemetry(frame, cur_fps, state.value, extra)

@@ -30,6 +30,71 @@ _GESTURE_LEGEND = [
 ]
 
 
+def draw_roi(
+    frame: np.ndarray,
+    roi_pcts: tuple[float, float, float, float],
+    hand_pos: tuple[int, int] | None = None,
+    in_roi: bool = True,
+) -> np.ndarray:
+    """在画面上画识别 ROI 区域 (中央矩形)。
+
+    roi_pcts: (x_pct, y_pct, w_pct, h_pct), 相对坐标 0~1
+    hand_pos: (cx, cy) 当前手中心, 用一个圆点画出来, 颜色随是否在 ROI 内变
+    in_roi: 手是否在 ROI 内 (true=绿色, false=红色, None=灰色)
+    """
+    h, w = frame.shape[:2]
+    x_pct, y_pct, w_pct, h_pct = roi_pcts
+    rx = int(w * x_pct)
+    ry = int(h * y_pct)
+    rw = int(w * w_pct)
+    rh = int(h * h_pct)
+
+    # 1) 半透明绿色填充
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), -1)
+    cv2.addWeighted(overlay, 0.06, frame, 0.94, 0, frame)
+    # 2) 绿色边框
+    cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
+    # 3) 角标 (黄色加粗, 像取景框)
+    corner = 22
+    thick = 3
+    yellow = (0, 255, 255)
+    # top-left
+    cv2.line(frame, (rx, ry), (rx + corner, ry), yellow, thick)
+    cv2.line(frame, (rx, ry), (rx, ry + corner), yellow, thick)
+    # top-right
+    cv2.line(frame, (rx + rw, ry), (rx + rw - corner, ry), yellow, thick)
+    cv2.line(frame, (rx + rw, ry), (rx + rw, ry + corner), yellow, thick)
+    # bottom-left
+    cv2.line(frame, (rx, ry + rh), (rx + corner, ry + rh), yellow, thick)
+    cv2.line(frame, (rx, ry + rh), (rx, ry + rh - corner), yellow, thick)
+    # bottom-right
+    cv2.line(frame, (rx + rw, ry + rh), (rx + rw - corner, ry + rh), yellow, thick)
+    cv2.line(frame, (rx + rw, ry + rh), (rx + rw, ry + rh - corner), yellow, thick)
+
+    # 4) 顶部中间 label: "RECOGNITION AREA"
+    label = "RECOGNITION AREA"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    cv2.rectangle(frame, (rx + (rw - tw) // 2 - 4, ry - th - 8),
+                  (rx + (rw + tw) // 2 + 4, ry), (0, 0, 0), -1)
+    cv2.putText(frame, label, (rx + (rw - tw) // 2, ry - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, yellow, 1)
+
+    # 5) 手位置标记 (小圆 + 状态色)
+    if hand_pos is not None:
+        cx, cy = hand_pos
+        if in_roi is None:
+            color = (200, 200, 200)
+        elif in_roi:
+            color = (0, 255, 0)
+        else:
+            color = (0, 0, 255)
+        cv2.circle(frame, (cx, cy), 8, color, 2)
+        cv2.circle(frame, (cx, cy), 3, color, -1)
+
+    return frame
+
+
 def draw_gesture_label(
     frame: np.ndarray,
     result: Optional[GestureResult],

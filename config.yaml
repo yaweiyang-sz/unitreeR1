@@ -30,6 +30,16 @@ gesture:
   debounce_frames: 6
   # 每帧最大处理时间 (ms)，超时则跳过
   max_inference_ms: 80
+  # 中央识别区域 (相对画面 0~1), 只识别这个矩形内的手
+  # 默认中央 60% 宽 x 80% 高, 边缘 20% 一圈忽略 (摄像头畸变 / 路过的人)
+  roi:
+    x_pct: 0.20
+    y_pct: 0.10
+    w_pct: 0.60
+    h_pct: 0.80
+  # 手部大小过滤 (占画面面积的百分比), 防止太远/太近误识别
+  min_hand_area_pct: 3.0    # < 3% 太远, 不识别
+  max_hand_area_pct: 50.0   # > 50% 太近, 不识别
 
 # 人体跟随
 follow:

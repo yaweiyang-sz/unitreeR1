@@ -53,6 +53,9 @@ class GestureResult:
     fingers_ratio: dict[str, float] = None  # 4 指用 tip-mcp/pip-mcp, 拇指用 tip-wrist/mcp-wrist
     wrist_vx: float = 0.0       # 手腕水平速度 (px/s), 正=向右, 负=向左
     hand_active: bool = False    # True = 5指全张 (激活态, 可走 LEFT/RIGHT/STOP)
+    # 位置 / 面积 (相对画面), UI 用来显示手在哪儿、有多大
+    hand_center: tuple[int, int] = (0, 0)  # (cx, cy) in pixels
+    hand_area_pct: float = 0.0             # 0~100, 占画面面积比例
 
     @property
     def is_valid(self) -> bool:
@@ -72,6 +75,14 @@ class HandGestureDetector:
         motion_window: int = 8,             # 速度平滑窗口 (帧)
         motion_speed_thresh: float = 150,   # 挥动识别阈值 (px/s)
         direction_hold_sec: float = 1.0,    # 方向持续时间 (s): 挥动停下后保持方向
+        # ROI 区域限制 (相对坐标 0~1, 0/0/1/1 = 全画面不过滤)
+        roi_x_pct: float = 0.20,
+        roi_y_pct: float = 0.10,
+        roi_w_pct: float = 0.60,
+        roi_h_pct: float = 0.80,
+        # 手部大小过滤 (相对画面面积的百分比), 0/100 = 不过滤
+        min_hand_area_pct: float = 3.0,     # 太远 (< 3%) 不识别
+        max_hand_area_pct: float = 50.0,    # 太近 (> 50%) 不识别
     ):
         try:
             import mediapipe as mp
@@ -132,6 +143,18 @@ class HandGestureDetector:
         self._last_dir: Optional[Gesture] = None
         self._last_dir_t: float = 0.0
 
+        # ROI 区域 (相对坐标 0~1, 默认中央 60%x80% 矩形)
+        self.roi_x_pct = roi_x_pct
+        self.roi_y_pct = roi_y_pct
+        self.roi_w_pct = roi_w_pct
+        self.roi_h_pct = roi_h_pct
+        # 大小过滤 (占画面百分比)
+        self.min_hand_area_pct = min_hand_area_pct
+        self.max_hand_area_pct = max_hand_area_pct
+        # 统计: 上次 detect 是否被 ROI / 大小过滤掉
+        self._filtered_by_roi: int = 0
+        self._filtered_by_size: int = 0
+
     def detect(self, frame_bgr: np.ndarray) -> Optional[GestureResult]:
         """对一帧 BGR 图像做手势检测。"""
         if frame_bgr is None or frame_bgr.size == 0:
@@ -162,6 +185,32 @@ class HandGestureDetector:
         dt_ms = (time.perf_counter() - t0) * 1000.0
         x, y, ww, hh = cv2.boundingRect(pts.astype(np.int32))
         hand_bbox = (x, y, ww, hh)
+        hand_cx, hand_cy = x + ww // 2, y + hh // 2
+        hand_area_pct = (ww * hh) / max(1, w * h) * 100.0
+
+        # ---- ROI 区域过滤 (中央区域内的手才识别) ----
+        if not (
+            self.roi_x_pct <= 0.0
+            and self.roi_y_pct <= 0.0
+            and self.roi_w_pct >= 1.0
+            and self.roi_h_pct >= 1.0
+        ):
+            roi_x = int(w * self.roi_x_pct)
+            roi_y = int(h * self.roi_y_pct)
+            roi_w = int(w * self.roi_w_pct)
+            roi_h = int(h * self.roi_h_pct)
+            if not (
+                roi_x <= hand_cx <= roi_x + roi_w
+                and roi_y <= hand_cy <= roi_y + roi_h
+            ):
+                self._filtered_by_roi += 1
+                return None
+
+        # ---- 大小过滤 (太远/太近的不要) ----
+        if not (self.min_hand_area_pct <= hand_area_pct <= self.max_hand_area_pct):
+            self._filtered_by_size += 1
+            return None
+
         fingers, ratios = _fingers_state(pts, handedness)
 
         # 计算手腕水平速度 (vx, px/s)
@@ -211,6 +260,8 @@ class HandGestureDetector:
             fingers_ratio=ratios,
             wrist_vx=wrist_vx,
             hand_active=hand_active,
+            hand_center=(hand_cx, hand_cy),
+            hand_area_pct=hand_area_pct,
         )
 
     def draw(self, frame_bgr: np.ndarray, result: Optional[GestureResult]) -> np.ndarray:
