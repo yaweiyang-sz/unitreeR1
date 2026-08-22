@@ -342,6 +342,43 @@ class _RealR1Client:
         assert self._loco, "未初始化"
         self._loco.StandUp2Lie()
 
+    # ---- 手臂任务 (高层动作 API, SetTaskId) ----
+
+    def wave_hand(self, turn_flag: bool = False) -> None:
+        """挥右手 (R1 LocoClient.WaveHand, task_id=0/1)。
+
+        Args:
+            turn_flag: False=单纯挥右手, True=挥手带转身
+
+        前置: 机器人在 Start (FSM 811) 模式 + 速度=0 (动态稳定站立)。
+        Stance (FSM 4) 模式下做这个动作可能不稳。
+        """
+        if not self._loco:
+            log.warning("wave_hand skipped — 未初始化")
+            return
+        try:
+            log.info(f"→ WaveHand(turn_flag={turn_flag})  挥右手")
+            self._loco.WaveHand(turn_flag)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"WaveHand 失败: {e}")
+
+    def shake_hand(self, stage: int = 0) -> None:
+        """伸手握手 (R1 LocoClient.ShakeHand, task_id=2/3)。
+
+        Args:
+            stage: 0/1/-1 (0/1 固定, -1 切换两次阶段)
+
+        前置: 同 wave_hand, 需在 Start 模式 + 速度=0。
+        """
+        if not self._loco:
+            log.warning("shake_hand skipped — 未初始化")
+            return
+        try:
+            log.info(f"→ ShakeHand(stage={stage})  伸手握手")
+            self._loco.ShakeHand(stage)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"ShakeHand 失败: {e}")
+
     def balance_stand(self) -> None:
         """兼容旧接口: R1 没有 BalanceStand, 用 Stance 等价。"""
         if not self._loco:
@@ -539,6 +576,12 @@ class _DryRunR1Client:
         self._fsm = R1FsmState.LIE_TO_STAND
         log.info("[DRY-RUN] StandUp2Lie()")
 
+    def wave_hand(self, turn_flag: bool = False) -> None:
+        log.info(f"[DRY-RUN] WaveHand(turn_flag={turn_flag})  挥右手")
+
+    def shake_hand(self, stage: int = 0) -> None:
+        log.info(f"[DRY-RUN] ShakeHand(stage={stage})  伸手握手")
+
     def balance_stand(self) -> None:
         self._fsm = R1FsmState.STAND
         self._state["mode"] = 4
@@ -648,6 +691,14 @@ class R1Client:
 
     def stand_down(self) -> None:
         self._impl.stand_down()
+
+    def wave_hand(self, turn_flag: bool = False) -> None:
+        """挥右手。委托给 _impl (真实 SDK 或 dry-run)。"""
+        self._impl.wave_hand(turn_flag=turn_flag)
+
+    def shake_hand(self, stage: int = 0) -> None:
+        """伸手握手。委托给 _impl。"""
+        self._impl.shake_hand(stage=stage)
 
     def move(self, vx: float, vy: float, vyaw: float) -> None:
         self._impl.move(vx, vy, vyaw)
