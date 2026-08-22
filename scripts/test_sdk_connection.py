@@ -51,6 +51,16 @@ def main() -> int:
         action="store_true",
         help="启用 SportModeState_ 订阅 (拿到 IMU/位置/速度, 默认关, 避免 cyclonedds 资源冲突)",
     )
+    p.add_argument(
+        "--enable-poll-fsm",
+        action="store_true",
+        help="启用 GetFsmId RPC (主动拉 FSM, 默认关 — 历史经验会让 R1 固件异常)",
+    )
+    p.add_argument(
+        "--minimal",
+        action="store_true",
+        help="最小化模式: 只 ChannelFactoryInitialize + LocoClient.Init + 退出, 完全照搬官方 example, 不会发任何 RPC",
+    )
     args = p.parse_args()
 
     mode = R1Mode.DRY_RUN if args.dry_run else R1Mode.REAL
@@ -63,6 +73,8 @@ def main() -> int:
 
     log.info("==== SDK 集成测试 (R1 LocoClient) ====")
     log.info(f"模式: {mode.value}  网卡: {args.iface}  状态主题: {args.sport_state_topic}  订阅: {'开' if args.enable_state_sub else '关(默认)'}")
+    if args.minimal:
+        log.info("[MINIMAL 模式] 只做 ChannelFactoryInit + LocoClient.Init + 退出, 不发任何 RPC")
     try:
         client.initialize()
     except Exception as e:  # noqa: BLE001
@@ -72,23 +84,34 @@ def main() -> int:
 
     log.info("✓ 初始化成功")
 
-    # 等最多 3s 让 SportModeState 订阅跑至少一两帧 (默认 1Hz 发布)
-    deadline = time.monotonic() + 3.0
-    st = client.get_state()
-    while not st and time.monotonic() < deadline:
-        time.sleep(0.2)
-        st = client.get_state()
-    if st:
-        log.info(
-            f"✓ 读到状态: mode={st.get('mode')}, pos={st.get('position')}, "
-            f"vel={st.get('velocity')}, imu_rpy={st.get('imu_rpy')}"
-        )
-    else:
-        log.warning("3s 内没读到 SportModeState — 主题名可能不对, 但 FSM 仍可通过 RPC 拿")
+    if args.minimal:
+        # 最小化模式: 直接 shutdown, 跟官方 example 行为完全一致
+        client.shutdown()
+        log.info("==== 完成 (minimal) ====")
+        return 0
 
-    # 主路径: 主动 RPC 拉一次 FSM
-    fsm = client.poll_fsm()
-    log.info(f"当前 FSM (via LocoClient.GetFsmId RPC): {fsm.value}")
+    # 等最多 3s 让 SportModeState 订阅跑至少一两帧 (默认 1Hz 发布)
+    if args.enable_state_sub:
+        deadline = time.monotonic() + 3.0
+        st = client.get_state()
+        while not st and time.monotonic() < deadline:
+            time.sleep(0.2)
+            st = client.get_state()
+        if st:
+            log.info(
+                f"✓ 读到状态: mode={st.get('mode')}, pos={st.get('position')}, "
+                f"vel={st.get('velocity')}, imu_rpy={st.get('imu_rpy')}"
+            )
+        else:
+            log.warning("3s 内没读到 SportModeState — 主题名可能不对, 但 FSM 仍可通过 RPC 拿")
+
+    # 默认**不**主动 RPC 拉 FSM (历史经验: GetFsmId 在 Stance 下会污染 R1 固件)
+    if args.enable_poll_fsm:
+        client.enable_poll_fsm()
+        fsm = client.poll_fsm()
+        log.info(f"当前 FSM (via LocoClient.GetFsmId RPC): {fsm.value}")
+    else:
+        log.info("FSM 主动探测默认关闭 (用 --enable-poll-fsm 打开, 默认安全)")
 
     if not args.enter_loco or args.dry_run:
         if args.dry_run:

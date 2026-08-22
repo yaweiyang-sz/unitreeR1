@@ -3,169 +3,225 @@
 R1 没有自己的 video_client, 走 unitree_sdk2py.go2.video.video_client.VideoClient
 (因为 Go2 与 R1 共用同一套 video_service, 都是 GetImageSample RPC)。
 
-为了确认 client 真的工作 (不是拿到占位 / 黑屏), 默认连续抓 5 帧写到 ./video_frames/
-你 scp / rsync 回来肉眼检查。
+⚠️ 视频抓取跑在**子进程**里: 某些 R1 固件在 video_service 状态不对时,
+   GetImageSample RPC 会让 cyclonedds C 层 segfault, Python try/except 拦不住。
+   子进程隔离后, 即便崩了父进程也能拿到 exit code (139 / -11 = SIGSEGV),
+   把信号、已抓到的帧、错误信息都给你, 不会拖死主程序。
 
 用法:
-    python3 scripts/test_video_stream.py eth0                 # 默认抓 5 帧
-    python3 scripts/test_video_stream.py eth0 --num 10        # 抓 10 帧
-    python3 scripts/test_video_stream.py eth0 --save one.jpg  # 只抓 1 帧 (旧行为)
-    python3 scripts/test_video_stream.py eth0 --preview       # 弹窗预览
-    python3 scripts/test_video_stream.py eth0 --out-dir /tmp/r1_frames  # 自定义输出目录
+    python3 scripts/test_video_stream.py eth10                # 默认抓 5 帧
+    python3 scripts/test_video_stream.py eth10 --num 10       # 抓 10 帧
+    python3 scripts/test_video_stream.py eth10 --save one.jpg # 只抓 1 帧
+    python3 scripts/test_video_stream.py eth10 --out-dir /tmp/r1_frames
+    python3 scripts/test_video_stream.py eth10 --probe        # 只跑一次 RPC, 不保存
 """
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import cv2
-import numpy as np
-
 from src.logger import setup_logger
-from src.robot.sdk_client import R1Client, R1Mode
 
 log = setup_logger("test.video")
 
 
-def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("iface", nargs="?", default="eth0")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--num", type=int, default=5, help="连续抓多少帧 (默认 5)")
-    p.add_argument("--interval", type=float, default=0.5, help="帧间隔 (秒, 默认 0.5)")
-    p.add_argument("--out-dir", default="./video_frames", help="输出目录")
-    p.add_argument("--preview", action="store_true", help="同时弹 OpenCV 窗口")
-    p.add_argument("--save", default=None, help="只抓 1 帧并另存为指定路径 (旧行为兼容)")
-    args = p.parse_args()
+# ============== 子进程 worker (顶层函数, Windows spawn 友好) ==============
 
-    mode = R1Mode.DRY_RUN if args.dry_run else R1Mode.REAL
-    client = R1Client(args.iface, mode=mode)
+def _video_worker(q, iface: str, num: int, interval: float, out_dir_str: str,
+                  save_single: str | None) -> None:
+    """子进程: 跑 VideoClient 抓帧, 把结果通过 Queue 送给父进程。
 
-    try:
-        client.initialize()
-    except Exception as e:  # noqa: BLE001
-        log.error(f"初始化失败: {e}")
-        return 1
+    通过 status code 报告:
+        0  成功, 全部抓完
+        1  初始化失败
+        2  抓帧中途失败 (但没崩)
+        3  SIGSEGV 等致命信号 (Python 通过异常信息推测, 实际是父进程看 exit code)
+    """
+    import cv2
+    import numpy as np
+    from src.robot.sdk_client import R1Client, R1Mode
 
-    # ---- 兼容旧 --save: 只抓 1 帧 ----
-    if args.save:
-        code, data = client.get_image()
-        if code != 0 or data is None:
-            log.error(f"取帧失败 code={code}")
-            client.shutdown()
-            return 2
-        arr = np.frombuffer(data, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            log.error("JPEG 解码失败")
-            client.shutdown()
-            return 3
-        Path(args.save).parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(args.save, frame)
-        log.info(f"✓ 已保存 {args.save} ({frame.shape[1]}x{frame.shape[0]})")
-        client.shutdown()
-        return 0
-
-    # ---- 默认行为: 连续抓 N 帧到 out_dir ----
-    out_dir = Path(args.out_dir)
+    out_dir = Path(out_dir_str)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 清掉上一次的, 避免混淆
-    for old in out_dir.glob("frame_*.jpg"):
+    try:
+        client = R1Client(iface, mode=R1Mode.REAL, enable_state_subscription=False)
+        client.initialize()
+    except Exception as e:  # noqa: BLE001
+        q.put({"status": 1, "error": f"init failed: {e}"})
+        return
+
+    # ---- --save 单帧模式 ----
+    if save_single:
         try:
-            old.unlink()
-        except Exception:  # noqa: BLE001
-            pass
+            code, data = client.get_image()
+            if code == 0 and data:
+                arr = np.frombuffer(data, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    p = Path(save_single)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(p), frame)
+                    q.put({"status": 0, "saved": [str(p)], "w": frame.shape[1], "h": frame.shape[0]})
+                else:
+                    q.put({"status": 2, "error": "JPEG decode failed"})
+            else:
+                q.put({"status": 2, "error": f"get_image code={code}"})
+        except Exception as e:  # noqa: BLE001
+            q.put({"status": 2, "error": str(e)})
+        finally:
+            client.shutdown()
+        return
 
-    log.info(f"开始抓 {args.num} 帧 → {out_dir.resolve()}")
-    log.info(f"间隔 {args.interval}s, 总耗时约 {args.num * args.interval:.1f}s")
-
-    saved: list[tuple[int, int, int, Path]] = []  # (idx, w, h, path)
-    failed_codes: list[int] = []
+    # ---- 默认多帧模式 ----
+    saved: list[dict] = []
     sizes: list[int] = []
-
     t_start = time.monotonic()
-    for i in range(args.num):
-        code, data = client.get_image()
+    for i in range(num):
+        try:
+            code, data = client.get_image()
+        except Exception as e:  # noqa: BLE001
+            q.put({"status": 2, "error": f"get_image raised: {e}", "saved": saved})
+            return
         t_now = time.monotonic() - t_start
-
         if code != 0 or not data:
-            failed_codes.append(code)
-            log.warning(f"  [{i+1:02d}/{args.num}] t={t_now:5.2f}s  code={code}  data=None")
-            time.sleep(args.interval)
+            time.sleep(interval)
             continue
-
-        arr = np.frombuffer(data, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        try:
+            arr = np.frombuffer(data, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        except Exception as e:  # noqa: BLE001
+            time.sleep(interval)
+            continue
         if frame is None:
-            log.warning(f"  [{i+1:02d}/{args.num}] t={t_now:5.2f}s  JPEG 解码失败 (字节数 {len(data)})")
-            time.sleep(args.interval)
+            time.sleep(interval)
             continue
-
         h, w = frame.shape[:2]
-        # 估算亮度: 太黑(<10) 或 太白(>245) 都可疑
         mean_luma = float(frame.mean())
-        is_black = mean_luma < 5
-        is_white = mean_luma > 250
-
         path = out_dir / f"frame_{i+1:02d}_t{t_now:05.2f}.jpg"
         cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         sizes.append(len(data))
-        saved.append((i + 1, w, h, path))
+        saved.append({"path": str(path), "w": w, "h": h, "luma": mean_luma, "bytes": len(data)})
+        time.sleep(interval)
 
-        flag = ""
-        if is_black:
-            flag = "  ⚠ 全黑 (mean luma < 5)"
-        elif is_white:
-            flag = "  ⚠ 全白 (mean luma > 250)"
+    q.put({"status": 0, "saved": saved, "sizes": sizes})
+
+
+# ============== 父进程 ==============
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("iface", nargs="?", default="eth10")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--num", type=int, default=5)
+    p.add_argument("--interval", type=float, default=0.5)
+    p.add_argument("--out-dir", default="./video_frames")
+    p.add_argument("--save", default=None)
+    p.add_argument("--probe", action="store_true", help="只跑一次 RPC, 不保存")
+    p.add_argument("--timeout", type=float, default=15.0, help="子进程超时 (秒)")
+    args = p.parse_args()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 兼容旧 --save
+    save_single = None if args.probe else args.save
+
+    if args.dry_run:
+        log.info("[DRY-RUN] 跳过真机, 写一张占位图到 out_dir")
+        import cv2
+        import numpy as np
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(img, "DRY-RUN placeholder", (50, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        path = out_dir / "dryrun.jpg"
+        cv2.imwrite(str(path), img)
+        log.info(f"  → {path}")
+        return 0
+
+    # ---- 用子进程跑, 隔离潜在 segfault ----
+    q: mp.Queue = mp.Queue(maxsize=1)
+    proc = mp.Process(
+        target=_video_worker,
+        args=(q, args.iface, args.num, args.interval, str(out_dir), save_single),
+        daemon=True,
+    )
+    log.info(f"启动子进程抓视频, iface={args.iface}, num={args.num}, timeout={args.timeout}s")
+    proc.start()
+    proc.join(timeout=args.timeout)
+
+    # ---- 子进程超时 ----
+    if proc.is_alive():
+        log.warning(f"子进程 {args.timeout}s 内没完成, terminate")
+        proc.terminate()
+        proc.join(1.0)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(0.5)
+        log.error("视频抓取超时 — R1 video_service 可能没响应")
+        return 5
+
+    # ---- 子进程被信号杀掉 (SIGSEGV = -11 on POSIX, 139 on POSIX exit code) ----
+    exit_code = proc.exitcode
+    if exit_code is not None and exit_code < 0:
+        sig = -exit_code
+        log.error(f"!!! 子进程被信号 {sig} 杀掉 (很可能是 SIGSEGV={11})")
+        log.error("R1 端 video_service 在当前状态下让 cyclonedds C 层段错误")
+        log.error("排查方向:")
+        log.error("  1) R1 是否在调试模式? (App 切到调试)")
+        log.error("  2) R1 App 里'视频'开关是否打开?")
+        log.error("  3) R1 firmware 版本是否过旧?")
+        log.error("  4) 试 cyclonedds ls 看 R1 是否在发 video 相关主题")
+        return 6
+
+    if exit_code not in (0, None):
+        log.error(f"子进程异常退出, exit code = {exit_code}")
+        return 7
+
+    # ---- 读子进程报告 ----
+    if q.empty():
+        log.error("子进程没回报结果")
+        return 8
+
+    result = q.get_nowait()
+    status = result.get("status", -1)
+    if status == 1:
+        log.error(f"子进程初始化失败: {result.get('error')}")
+        return 1
+    if status == 2:
+        log.warning(f"子进程抓帧失败: {result.get('error')}")
+        if result.get("saved"):
+            log.info(f"但保存了 {len(result['saved'])} 帧, 检查 {out_dir}")
+        return 2
+
+    # ---- 成功, 整理输出 ----
+    saved = result.get("saved", [])
+    sizes = result.get("sizes", [])
+    log.info("=" * 60)
+    log.info(f"成功抓到 {len(saved)} 帧")
+    for s in saved:
+        path = Path(s["path"])
         log.info(
-            f"  [{i+1:02d}/{args.num}] t={t_now:5.2f}s  {w}x{h}  "
-            f"{len(data):>7} bytes  mean_luma={mean_luma:6.1f}{flag}"
+            f"  - {path.name}  {s['w']}x{s['h']}  {s['bytes']:>7} B  "
+            f"luma={s['luma']:6.1f}"
         )
 
-        if args.preview:
-            cv2.putText(
-                frame, f"R1 camera frame {i+1}/{args.num}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-            )
-            cv2.imshow("R1 Camera", frame)
+    if sizes and len(set(sizes)) > 1:
+        log.info(f"帧字节数变化 {min(sizes)} ~ {max(sizes)}  → 确认是真视频流")
+    elif sizes:
+        log.warning(f"所有帧字节数都是 {sizes[0]} — 可能是同一帧 / 占位图, 请肉眼确认")
 
-        time.sleep(args.interval)
+    if args.probe:
+        log.info("(probe 模式: 上面只是单次探测结果, 没保存)")
 
-    if args.preview:
-        cv2.waitKey(500)
-        cv2.destroyAllWindows()
-
-    client.shutdown()
-
-    # ---- 总结 ----
-    print()
+    log.info(f"输出目录: {out_dir.resolve()}")
     log.info("=" * 60)
-    log.info(f"共抓 {args.num} 帧, 成功 {len(saved)}, 失败 {len(failed_codes)}")
-    if failed_codes:
-        log.warning(f"失败 code: {failed_codes}")
-    if saved:
-        log.info(f"输出目录: {out_dir.resolve()}")
-        for idx, w, h, p in saved:
-            log.info(f"  - {p.name}  ({w}x{h})")
-
-        # 文件字节差异: 如果每张都几乎一样大小, 可能是同一帧 / 占位图
-        if len(sizes) >= 2:
-            size_set = set(sizes)
-            if len(size_set) == 1:
-                log.warning("⚠ 所有帧字节数完全相同 — 可能是同一帧 / 占位图, 请肉眼确认")
-            else:
-                spread = max(sizes) - min(sizes)
-                log.info(
-                    f"帧字节数范围: {min(sizes)} ~ {max(sizes)} (spread {spread}) — 有变化 = 真视频"
-                )
-
-    log.info("=" * 60)
-    return 0 if saved else 4
+    return 0
 
 
 if __name__ == "__main__":

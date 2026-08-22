@@ -60,6 +60,15 @@ SPORT_STATE_TOPIC_DEFAULT = "rt/sportmodestate"
 SPORT_STATE_TOPIC_ALT = "rt/lf/sportmodestate"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """读环境变量当 bool flag。'1'/'true'/'yes'/'on' (大小写不敏感) 视为 True。"""
+    import os
+    v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on")
+
+
 # ============================================================
 #  真实 SDK 实现
 # ============================================================
@@ -86,6 +95,12 @@ class _RealR1Client:
 
         self._lock = threading.Lock()
         self._connected = False
+        # 必须在 enter_locomotion() 之后, move() 才会真发到 R1
+        # 避免在 Stance 下误发 SetVelocity 让 R1 固件进异常状态
+        self._in_locomotion: bool = False
+        # poll_fsm 默认关闭 — 防止 GetFsmId RPC 把 R1 固件弄坏
+        # 想开就调 enable_poll_fsm() 或设环境变量 R1_ENABLE_POLL_FSM=1
+        self._enable_poll_fsm: bool = _env_flag("R1_ENABLE_POLL_FSM", False)
 
         # 状态缓存 (DDS 订阅回调写入)
         self._last_state: dict = {}
@@ -219,9 +234,23 @@ class _RealR1Client:
             return self._fsm_state
 
     def poll_fsm(self) -> R1FsmState:
-        """主动通过 RPC 拉一次 FSM (DDS 订阅没建好或主程序需要确认时用)。"""
+        """主动通过 RPC 拉一次 FSM (DDS 订阅没建好或主程序需要确认时用)。
+
+        ⚠️ **默认关闭** — 历史经验: 给 Stance 下的 R1 发 GetFsmId RPC 会让 R1 固件
+        进入异常状态, 后续所有 RPC 都段错误。需要时由调用方显式打开 (env var
+        R1_ENABLE_POLL_FSM=1 或 调 enable_poll_fsm())。底层走子进程隔离,
+        即使 segfault 也不会拖死主进程, 但 R1 端状态还是会被搞坏。
+        """
+        if not self._enable_poll_fsm:
+            log.debug("poll_fsm 跳过 (未启用, 设环境变量 R1_ENABLE_POLL_FSM=1 打开)")
+            return self.get_fsm_state()
         self._refresh_fsm_via_rpc()
         return self.get_fsm_state()
+
+    def enable_poll_fsm(self) -> None:
+        """显式启用 poll_fsm() 主动 RPC 拉 FSM。默认关闭, 防止误调让 R1 端固件异常。"""
+        self._enable_poll_fsm = True
+        log.info("poll_fsm 已启用 (会真给 R1 发 GetFsmId RPC, 仅在 R1 已知健康时用)")
 
     def enter_locomotion(self) -> None:
         """进入 locomotion 模式 (FSM 811)。
@@ -234,6 +263,7 @@ class _RealR1Client:
         assert self._loco, "未初始化"
         log.warning("→ Start()  进入 locomotion  (FSM 811) — 危险操作, 请确认安全")
         self._loco.Start()
+        self._in_locomotion = True
         time.sleep(0.3)  # 给 FSM 切换一点时间
 
     def exit_locomotion(self) -> None:
@@ -241,7 +271,9 @@ class _RealR1Client:
         if not self._loco:
             return
         try:
-            self._loco.StopMove()
+            # 只有在 locomotion 状态才发 StopMove, 避免 Stance 下误发
+            if self._in_locomotion:
+                self._loco.StopMove()
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -249,12 +281,14 @@ class _RealR1Client:
             log.info("→ Stance()  (FSM 4) 退出 locomotion")
         except Exception as e:  # noqa: BLE001
             log.warning(f"Stance() 失败: {e}")
+        self._in_locomotion = False
 
     def damp(self) -> None:
         """切到 Damp (FSM 1) — 切断电机, 自由落体, 急停用。"""
         assert self._loco, "未初始化"
         log.warning("→ Damp()  (FSM 1) 切断电机, 机器人会瘫软 — 急停!")
         self._loco.Damp()
+        self._in_locomotion = False
 
     def stand_up_from_lie(self) -> None:
         """从躺姿站起 (FSM 701)。"""
@@ -301,8 +335,19 @@ class _RealR1Client:
         R1 LocoClient 的 Move(vx, vy, vyaw, continous_move=False) 默认 1 秒后自动停。
         我们的控制循环是周期性的 (默认 30 Hz), 所以用 continous_move=True 保持持续。
         如果你只是想"踩一下油门"再放手, 传一个 < 1.0s 的 duration, 这里不暴露 — 都在外面用速度表达。
+
+        ⚠️ 安全门: 没调 enter_locomotion() 之前, 这个方法是 **no-op**。
+        原因是 R1 在 Stance (FSM 4) 下收到 SetVelocity 是未定义行为, 历史上会把
+        R1 固件弄成半坏状态, 后续所有 RPC 都段错误。所以加一个 flag 卡住。
         """
         if not self._loco:
+            return
+        if not self._in_locomotion:
+            # 不真发, 但要 log 出来 (debug 级别, 避免循环里刷屏)
+            log.debug(
+                f"move({vx:.2f},{vy:.2f},{vyaw:.2f}) ignored — 未在 locomotion, "
+                f"需先调 enter_locomotion()"
+            )
             return
         with self._lock:
             try:
@@ -311,7 +356,11 @@ class _RealR1Client:
                 log.debug(f"Move 异常: {e}")
 
     def stop_move(self) -> None:
+        """清零速度。仅在 locomotion 状态生效 (见 move() 的安全门)。"""
         if not self._loco:
+            return
+        if not self._in_locomotion:
+            log.debug("stop_move ignored — 未在 locomotion")
             return
         with self._lock:
             try:
@@ -345,9 +394,21 @@ class _RealR1Client:
             - stop_move()         # 速度清零 (FSM 811 下生效)
             - exit_locomotion()   # Stance (FSM 4) 完整退出
             - damp()              # 急停, 切断电机
+
+        还会调用 ChannelFactory.Finalize() (如果 SDK 暴露了的话) — 把 DDS
+        participant 干净地从网络下线, 避免下一次脚本创建新 participant 时
+        拿到陈旧 participant ID 引起 R1 端固件异常。
         """
-        log.info("R1 客户端关闭中... (不发指令, 只清客户端对象)")
+        log.info("R1 客户端关闭中... (不发指令, 只清客户端对象 + DDS Finalize)")
         self._connected = False
+        # 尝试 Finalize DDS factory, 让 participant 干净下线
+        try:
+            from unitree_sdk2py.core.channel import ChannelFactory  # type: ignore
+            if hasattr(ChannelFactory, "Finalize"):
+                ChannelFactory.Finalize()
+                log.debug("ChannelFactory.Finalize() ✓")
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"ChannelFactory.Finalize 不可用或失败: {e}")
         log.info("R1 客户端已关闭")
 
 
@@ -361,6 +422,8 @@ class _DryRunR1Client:
     def __init__(self, network_iface: str, sport_state_topic: str = SPORT_STATE_TOPIC_DEFAULT):
         self.iface = network_iface
         self._fsm = R1FsmState.STAND
+        self._in_locomotion = False  # 与 _RealR1Client 一致
+        self._enable_poll_fsm: bool = _env_flag("R1_ENABLE_POLL_FSM", False)
         self._state = {
             "mode": 4,  # stance
             "position": [0.0, 0.0, 0.0],
@@ -379,19 +442,30 @@ class _DryRunR1Client:
         return self._fsm
 
     def poll_fsm(self) -> R1FsmState:
+        if not self._enable_poll_fsm:
+            return self._fsm
         return self._fsm
+
+    def enable_poll_fsm(self) -> None:
+        self._enable_poll_fsm = True
 
     def enter_locomotion(self) -> None:
         self._fsm = R1FsmState.RUNNING
+        self._in_locomotion = True
         log.info("[DRY-RUN] Start()  → RUNNING")
 
     def exit_locomotion(self) -> None:
         self._last_cmd = (0.0, 0.0, 0.0)
         self._fsm = R1FsmState.STAND
+        self._in_locomotion = False
+        # 清掉 stale velocity, 避免退出后 UI 看着还在动
+        self._state["velocity"] = [0.0, 0.0, 0.0]
+        self._state["yaw_speed"] = 0.0
         log.info("[DRY-RUN] Stance()  → STAND")
 
     def damp(self) -> None:
         self._fsm = R1FsmState.DAMP
+        self._in_locomotion = False
         log.info("[DRY-RUN] Damp()")
 
     def stand_up_from_lie(self) -> None:
@@ -413,6 +487,9 @@ class _DryRunR1Client:
         self._fsm = R1FsmState.LIE_TO_STAND
 
     def move(self, vx: float, vy: float, vyaw: float) -> None:
+        if not self._in_locomotion:
+            log.debug(f"[DRY-RUN] move({vx:.2f},{vy:.2f},{vyaw:.2f}) ignored — 未在 locomotion")
+            return
         self._last_cmd = (vx, vy, vyaw)
         # 模拟机器人位置/速度/IMU 的变化
         self._state["velocity"] = [vx, vy, 0.0]
@@ -512,6 +589,10 @@ class R1Client:
 
     def poll_fsm(self) -> R1FsmState:
         return self._impl.poll_fsm()
+
+    def enable_poll_fsm(self) -> None:
+        """显式启用 poll_fsm() 的 GetFsmId RPC。默认关闭。"""
+        self._impl.enable_poll_fsm()
 
     def get_image(self) -> tuple[int, Optional[bytes]]:
         return self._impl.get_image()
