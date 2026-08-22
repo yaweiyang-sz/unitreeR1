@@ -67,9 +67,17 @@ SPORT_STATE_TOPIC_ALT = "rt/lf/sportmodestate"
 class _RealR1Client:
     """包装宇树 R1 LocoClient，提供高层运控 + 视频 + 状态订阅。"""
 
-    def __init__(self, network_iface: str, sport_state_topic: str = SPORT_STATE_TOPIC_DEFAULT):
+    def __init__(
+        self,
+        network_iface: str,
+        sport_state_topic: str = SPORT_STATE_TOPIC_DEFAULT,
+        enable_state_subscription: bool = False,
+    ):
         self.iface = network_iface
         self.sport_state_topic = sport_state_topic
+        # ⚠️ 默认关: ChannelSubscriber 跟 LocoClient RPC 抢 cyclonedds 资源,
+        # 某些 R1 固件上会让 shutdown 段错误。要富信息 (IMU/位置/速度) 时手动开。
+        self.enable_state_subscription = enable_state_subscription
 
         # SDK 对象 (延迟到 initialize 中实例化)
         self._loco = None
@@ -127,30 +135,33 @@ class _RealR1Client:
         #      主题名找不到就静默降级, 不阻塞初始化 ----
         # 注意: 这里不主动 GetFsmId() — 部分 R1 固件对 GET_FSM_ID 的参数格式敏感,
         # 乱发会触发 cyclonedds C 层 segfault。改成由调用方显式 poll_fsm() 触发。
-        # DDS 订阅 (best-effort)
-        try:
-            self._state_sub = ChannelSubscriber(self.sport_state_topic, SportModeState_)
-            self._state_sub.Init(self._on_sport_state, 10)
-            log.info(f"SportModeState 订阅 ✓  topic={self.sport_state_topic}")
-        except Exception as e:  # noqa: BLE001
-            if self.sport_state_topic != SPORT_STATE_TOPIC_ALT:
-                log.warning(f"订阅 {self.sport_state_topic} 失败 ({e}), 尝试 {SPORT_STATE_TOPIC_ALT}")
-                try:
-                    self.sport_state_topic = SPORT_STATE_TOPIC_ALT
-                    self._state_sub = ChannelSubscriber(self.sport_state_topic, SportModeState_)
-                    self._state_sub.Init(self._on_sport_state, 10)
-                    log.info(f"SportModeState 订阅 ✓  topic={self.sport_state_topic}")
-                except Exception as e2:  # noqa: BLE001
+        # DDS 订阅 (best-effort, 默认关 — 见 __init__ enable_state_subscription)
+        if self.enable_state_subscription:
+            try:
+                self._state_sub = ChannelSubscriber(self.sport_state_topic, SportModeState_)
+                self._state_sub.Init(self._on_sport_state, 10)
+                log.info(f"SportModeState 订阅 ✓  topic={self.sport_state_topic}")
+            except Exception as e:  # noqa: BLE001
+                if self.sport_state_topic != SPORT_STATE_TOPIC_ALT:
+                    log.warning(f"订阅 {self.sport_state_topic} 失败 ({e}), 尝试 {SPORT_STATE_TOPIC_ALT}")
+                    try:
+                        self.sport_state_topic = SPORT_STATE_TOPIC_ALT
+                        self._state_sub = ChannelSubscriber(self.sport_state_topic, SportModeState_)
+                        self._state_sub.Init(self._on_sport_state, 10)
+                        log.info(f"SportModeState 订阅 ✓  topic={self.sport_state_topic}")
+                    except Exception as e2:  # noqa: BLE001
+                        log.warning(
+                            f"alt 主题 {SPORT_STATE_TOPIC_ALT} 也订阅失败 ({e2}), "
+                            f"SportModeState 订阅降级 — 富信息 (IMU/位置) 暂不可用, FSM 仍可读"
+                        )
+                        self._state_sub = None
+                else:
                     log.warning(
-                        f"alt 主题 {SPORT_STATE_TOPIC_ALT} 也订阅失败 ({e2}), "
-                        f"SportModeState 订阅降级 — 富信息 (IMU/位置) 暂不可用, FSM 仍可读"
+                        f"SportModeState 订阅降级 — 富信息 (IMU/位置) 暂不可用, FSM 仍可读: {e}"
                     )
                     self._state_sub = None
-            else:
-                log.warning(
-                    f"SportModeState 订阅降级 — 富信息 (IMU/位置) 暂不可用, FSM 仍可读: {e}"
-                )
-                self._state_sub = None
+        else:
+            log.info("SportModeState 订阅默认关闭 (需 enable_state_subscription=True 才建)")
 
         self._connected = True
         log.info("R1 客户端就绪 (尚未进入 locomotion)")
@@ -328,12 +339,14 @@ class _RealR1Client:
     # ---- 关闭 ----
 
     def shutdown(self) -> None:
-        log.info("R1 客户端关闭中...")
-        try:
-            if self._loco:
-                self._loco.StopMove()
-        except Exception:  # noqa: BLE001
-            pass
+        """清理客户端状态。**不**主动给 R1 发任何指令 (避免关进程时 segfault)。
+
+        想要停机器人, 显式调:
+            - stop_move()         # 速度清零 (FSM 811 下生效)
+            - exit_locomotion()   # Stance (FSM 4) 完整退出
+            - damp()              # 急停, 切断电机
+        """
+        log.info("R1 客户端关闭中... (不发指令, 只清客户端对象)")
         self._connected = False
         log.info("R1 客户端已关闭")
 
@@ -436,12 +449,18 @@ class _DryRunR1Client:
 class R1Client:
     """对外统一接口: 根据 mode 选择真实/模拟。"""
 
-    def __init__(self, network_iface: str, mode: R1Mode = R1Mode.REAL, sport_state_topic: str = SPORT_STATE_TOPIC_DEFAULT):
+    def __init__(
+        self,
+        network_iface: str,
+        mode: R1Mode = R1Mode.REAL,
+        sport_state_topic: str = SPORT_STATE_TOPIC_DEFAULT,
+        enable_state_subscription: bool = False,
+    ):
         self.mode = mode
         if mode == R1Mode.DRY_RUN:
             self._impl: _RealR1Client | _DryRunR1Client = _DryRunR1Client(network_iface, sport_state_topic)
         else:
-            self._impl = _RealR1Client(network_iface, sport_state_topic)
+            self._impl = _RealR1Client(network_iface, sport_state_topic, enable_state_subscription)
 
     @property
     def iface(self) -> str:

@@ -15,6 +15,10 @@ robot:
   # SportModeState_ DDS 订阅主题 (rt/sportmodestate 与 Go2 一致;
   # 新版固件用 rt/lf/sportmodestate, sdk_client 会自动 fallback)
   sport_state_topic: "rt/sportmodestate"
+  # 是否启用 SportModeState_ 订阅 (拿到 IMU / 位置 / 速度 / yaw_speed 等富信息)。
+  # 默认 false: 订阅跟 LocoClient RPC 抢 cyclonedds 资源, 某些 R1 固件上会引发
+  # shutdown 段错误。打开前确认 R1 端稳定。
+  enable_state_subscription: false
   # 是否在启动后让机器人真的进入 locomotion (FSM 811)。
   # 强烈建议保持 false, 用 CLI --enable-loco 显式触发。
   auto_enter_locomotion: false

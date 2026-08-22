@@ -46,13 +46,23 @@ def main() -> int:
         default="rt/sportmodestate",
         help="SportModeState_ DDS 主题",
     )
+    p.add_argument(
+        "--enable-state-sub",
+        action="store_true",
+        help="启用 SportModeState_ 订阅 (拿到 IMU/位置/速度, 默认关, 避免 cyclonedds 资源冲突)",
+    )
     args = p.parse_args()
 
     mode = R1Mode.DRY_RUN if args.dry_run else R1Mode.REAL
-    client = R1Client(args.iface, mode=mode, sport_state_topic=args.sport_state_topic)
+    client = R1Client(
+        args.iface,
+        mode=mode,
+        sport_state_topic=args.sport_state_topic,
+        enable_state_subscription=args.enable_state_sub,
+    )
 
     log.info("==== SDK 集成测试 (R1 LocoClient) ====")
-    log.info(f"模式: {mode.value}  网卡: {args.iface}  状态主题: {args.sport_state_topic}")
+    log.info(f"模式: {mode.value}  网卡: {args.iface}  状态主题: {args.sport_state_topic}  订阅: {'开' if args.enable_state_sub else '关(默认)'}")
     try:
         client.initialize()
     except Exception as e:  # noqa: BLE001
