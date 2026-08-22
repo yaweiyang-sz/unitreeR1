@@ -3,10 +3,13 @@
 # =====================================================
 
 robot:
-  # 网络接口名（Jetson Nano 与 R1 通过网线直连时的网卡名）
-  # 实际名以 `ip a` 看到的为准，常见: eth0, enp0s3, eno1
+  # 网络接口名 — 必须是接 R1 机器人 LAN (192.168.123.x) 的那块网卡, 不是连外网/办公网的那块
+  # 在 Jetson 上跑 `ip a` 看, 找 inet 是 192.168.123.164 的那块, 名字可能是:
+  #   - eth10   (常见, Jetson 内部 eth0 是 dev 网, eth10 才是 R1 网)
+  #   - eth0    (如果 Jetson 只有一块网线接 R1, 名字就是 eth0)
+  #   - enp0s3, eno1  (某些 PCIe 网卡)
   # ChannelFactoryInitialize(0, interface) 会把这个网卡作为 DDS 出口
-  network_interface: "eth0"
+  network_interface: "eth10"
   # 机器人机载 PC2 (Jetson Nano) IP，调试用
   onboard_pc_ip: "192.168.123.164"
   # SportModeState_ DDS 订阅主题 (rt/sportmodestate 与 Go2 一致;

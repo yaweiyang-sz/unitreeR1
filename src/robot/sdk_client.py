@@ -83,6 +83,8 @@ class _RealR1Client:
         self._last_state: dict = {}
         self._fsm_state: R1FsmState = R1FsmState.UNKNOWN
         self._state_lock = threading.Lock()
+        # GetFsmId RPC 只调一次 (避免重复触发潜在 segfault)
+        self._fsm_rpc_tried: bool = False
 
     # ---- 初始化 ----
 
@@ -123,8 +125,8 @@ class _RealR1Client:
         # ---- 状态: 主路径 LocoClient RPC GetFsmId() (必拿得到, 已通过 Init 验证通道)
         #      副路径 ChannelSubscriber(SportModeState_) 仅用于富信息 (IMU/位置/速度);
         #      主题名找不到就静默降级, 不阻塞初始化 ----
-        # 主动拉一次 FSM 状态, 让 fsm 立刻有值
-        self._refresh_fsm_via_rpc()
+        # 注意: 这里不主动 GetFsmId() — 部分 R1 固件对 GET_FSM_ID 的参数格式敏感,
+        # 乱发会触发 cyclonedds C 层 segfault。改成由调用方显式 poll_fsm() 触发。
         # DDS 订阅 (best-effort)
         try:
             self._state_sub = ChannelSubscriber(self.sport_state_topic, SportModeState_)
@@ -176,24 +178,28 @@ class _RealR1Client:
             self._fsm_state = _mode_to_fsm(self._last_state["mode"])
 
     def _refresh_fsm_via_rpc(self) -> None:
-        """通过 LocoClient.GetFsmId() RPC 拉一次当前 FSM id。
+        """通过 LocoClient.GetFsmId() RPC 拉一次当前 FSM id (子进程隔离)。
+
         这是**主路径**, 通道已通过 LocoClient.Init() 验证。
         返回值形如 {"data": <fsm_id>} (与 SetFsmId 互为反向)。
+
+        ⚠️ 必须在子进程里跑: 部分 R1 固件对 GET_FSM_ID 的参数格式敏感, 参数不对
+        会让 R1 端返回乱码, cyclonedds C 层解析时 segfault, Python try/except 拦不住。
+        子进程隔离后, 即便 segfault 也只是这个探测子进程死掉, 主程序不受影响。
         """
         if not self._loco:
             return
+        if self._fsm_rpc_tried:
+            return
+        self._fsm_rpc_tried = True
         try:
-            import json as _json
-            code, data = self._loco._Call(7001, "{}")  # ROBOT_API_ID_LOCO_GET_FSM_ID
-            if code == 0 and data:
-                d = _json.loads(data) if isinstance(data, (str, bytes)) else data
-                fsm_id = d.get("data") if isinstance(d, dict) else None
-                if fsm_id is not None:
-                    with self._state_lock:
-                        self._fsm_state = _mode_to_fsm(int(fsm_id))
-                        self._last_state["mode"] = int(fsm_id)
+            fsm_id = _get_fsm_id_in_subprocess(timeout=2.0)
+            if fsm_id is not None:
+                with self._state_lock:
+                    self._fsm_state = _mode_to_fsm(int(fsm_id))
+                    self._last_state["mode"] = int(fsm_id)
         except Exception as e:  # noqa: BLE001
-            log.debug(f"GetFsmId RPC 失败: {e}")
+            log.debug(f"GetFsmId RPC 探测失败: {e}")
 
     # ---- 状态机高层操作 ----
 
@@ -518,3 +524,54 @@ def _mode_to_fsm(mode: int) -> R1FsmState:
         702: R1FsmState.STAND_TO_LIE,
         811: R1FsmState.RUNNING,
     }.get(mode, R1FsmState.UNKNOWN)
+
+
+def _get_fsm_id_in_subprocess(timeout: float = 2.0) -> Optional[int]:
+    """在子进程里调 LocoClient.GetFsmId()。
+
+    用 multiprocessing 隔离 cyclonedds 潜在的 segfault, 父进程最多等 timeout 秒。
+    返回 fsm_id (int) 或 None (失败/超时/segfault)。
+
+    之所以要子进程: cyclonedds 的 C 代码 segfault 时, Python 的 try/except 拦不住,
+    整个进程直接挂掉, 主程序也跟着死。子进程隔离后, 即便崩了, 父进程 timeout
+    后还能继续走 (FSM 不可用而已, Move 指令照发)。
+    """
+    import json as _json
+    import multiprocessing as _mp
+
+    q: _mp.Queue = _mp.Queue(maxsize=1)
+    p = _mp.Process(target=_get_fsm_id_worker, args=(q,), daemon=True)
+    p.start()
+    p.join(timeout=timeout)
+    if p.is_alive():
+        p.terminate()
+        p.join(0.5)
+        if p.is_alive():
+            p.kill()
+        return None
+    if not q.empty():
+        v = q.get_nowait()
+        return v if v >= 0 else None
+    return None
+
+
+def _get_fsm_id_worker(q) -> None:
+    """子进程 worker: 跑 LocoClient.GetFsmId() 并把 fsm_id 塞进 Queue。
+
+    必须是**模块顶层函数**才能在 Windows spawn multiprocessing 下 pickle。
+    """
+    try:
+        from unitree_sdk2py.r1.loco.r1_loco_client import LocoClient
+        c = LocoClient()
+        c.SetTimeout(2.0)
+        c.Init()
+        code, data = c._Call(7001, '{"data":0}')  # ROBOT_API_ID_LOCO_GET_FSM_ID
+        if code == 0 and data:
+            import json as _json
+            d = _json.loads(data) if isinstance(data, (str, bytes)) else data
+            fsm_id = d.get("data") if isinstance(d, dict) else None
+            q.put(int(fsm_id) if fsm_id is not None else -1)
+        else:
+            q.put(-1)
+    except Exception:
+        q.put(-1)

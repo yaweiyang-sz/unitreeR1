@@ -101,7 +101,7 @@ unitreeR1/
 
 ```
 python3 src/main.py <iface> [选项]
-  <iface>            机器人所在网卡 (DDS 出口), 如 eth0
+  <iface>            接 R1 机器人 LAN (192.168.123.x) 的网卡, 如 eth10 (看你的 `ip a`)
   --config FILE      配置文件 (默认 config.yaml)
   --dry-run          完全不连机器人, 用本机 USB 摄像头模拟
   --no-window        不显示 OpenCV 窗口

@@ -3,10 +3,14 @@
 按 R1 LocoClient 的真实 FSM 流程跑, 默认不在 Stance 之外发移动指令。
 要看机器人真的动起来, 加 --enter-loco (会要求二次确认)。
 
+⚠️ iface 必须是接 R1 机器人 LAN (192.168.123.x) 的那块网卡,
+   常见命名: Jetson 上是 eth10 (192.168.123.164) 或 eth0 (看固件),
+   不是连外网 / 办公网的那块网卡。
+
 用法:
-    python3 scripts/test_sdk_connection.py eth0             # 只测连接 + 状态
-    python3 scripts/test_sdk_connection.py eth0 --enter-loco # Stance -> Start -> Move -> Stance
-    python3 scripts/test_sdk_connection.py eth0 --dry-run
+    python3 scripts/test_sdk_connection.py eth10            # 只测连接 + 状态
+    python3 scripts/test_sdk_connection.py eth10 --enter-loco # Stance -> Start -> Move -> Stance
+    python3 scripts/test_sdk_connection.py eth10 --dry-run
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ log = setup_logger("test.sdk")
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("iface", nargs="?", default="eth0")
+    p.add_argument("iface", nargs="?", default="eth10")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
         "--enter-loco",
