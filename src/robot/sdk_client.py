@@ -283,10 +283,20 @@ class _RealR1Client:
             log.warning(f"Stance() 失败: {e}")
         self._in_locomotion = False
 
-    def damp(self) -> None:
-        """切到 Damp (FSM 1) — 切断电机, 自由落体, 急停用。"""
+    def damp(self, force: bool = False) -> None:
+        """切到 Damp (FSM 1) — 切断电机, 自由落体, **只有急停才用**。
+
+        ⚠️ 极度危险: 历史上 R1 固件在 Damp 状态下 DDS 响应会让 cyclonedds
+        segfault, 且没有软件方式能让 R1 恢复, 必须物理 power cycle。
+        默认拒绝调用, 必须显式 force=True 才能执行。"""
         assert self._loco, "未初始化"
-        log.warning("→ Damp()  (FSM 1) 切断电机, 机器人会瘫软 — 急停!")
+        if not force:
+            log.error(
+                "  !!!!! Damp() 被拒绝 — 极度危险操作, 必须 power cycle R1 才能恢复 !!!!!\n"
+                "  如果是真的急停 (机器人要撞墙了), 调 damp(force=True)"
+            )
+            return
+        log.warning("→ Damp()  (FSM 1) 切断电机 — R1 会瘫软且只能 power cycle 恢复")
         self._loco.Damp()
         self._in_locomotion = False
 
@@ -463,10 +473,15 @@ class _DryRunR1Client:
         self._state["yaw_speed"] = 0.0
         log.info("[DRY-RUN] Stance()  → STAND")
 
-    def damp(self) -> None:
+    def damp(self, force: bool = False) -> None:
+        if not force:
+            log.error(
+                "  !!!!! [DRY-RUN] Damp() 被拒绝 — 必须 force=True !!!!!"
+            )
+            return
         self._fsm = R1FsmState.DAMP
         self._in_locomotion = False
-        log.info("[DRY-RUN] Damp()")
+        log.info("[DRY-RUN] Damp() (force=True)")
 
     def stand_up_from_lie(self) -> None:
         self._fsm = R1FsmState.STAND
@@ -557,8 +572,8 @@ class R1Client:
     def exit_locomotion(self) -> None:
         self._impl.exit_locomotion()
 
-    def damp(self) -> None:
-        self._impl.damp()
+    def damp(self, force: bool = False) -> None:
+        self._impl.damp(force=force)
 
     def stand_up_from_lie(self) -> None:
         self._impl.stand_up_from_lie()
