@@ -113,7 +113,9 @@ class _RealR1Client:
         self._video = VideoClient()
         self._video.SetTimeout(3.0)
         ret = self._video.Init()
-        if ret != 0:
+        # Go2 VideoClient.Init() 不显式 return, 成功时为 None, 失败时抛异常
+        # 这里 None/0 都视为成功, 只在真返回错误码时告警
+        if ret is not None and ret != 0:
             log.warning(f"VideoClient.Init() 返回 {ret}, 可能无视频流或服务未启用")
         else:
             log.info("VideoClient.Init() ✓")

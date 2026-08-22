@@ -58,16 +58,19 @@ def main() -> int:
 
     log.info("✓ 初始化成功")
 
-    # 等 0.5s 让 SportModeState 订阅跑一两帧
-    time.sleep(0.5)
+    # 等最多 3s 让 SportModeState 订阅跑至少一两帧 (默认 1Hz 发布)
+    deadline = time.monotonic() + 3.0
     st = client.get_state()
+    while not st and time.monotonic() < deadline:
+        time.sleep(0.2)
+        st = client.get_state()
     if st:
         log.info(
             f"✓ 读到状态: mode={st.get('mode')}, pos={st.get('position')}, "
             f"vel={st.get('velocity')}, imu_rpy={st.get('imu_rpy')}"
         )
     else:
-        log.warning("读不到状态 (订阅未触发, 正常 1Hz 慢发, 稍等即可)")
+        log.warning("3s 内没读到状态 — 主题名可能不对, 试试 --sport-state-topic rt/lf/sportmodestate")
 
     fsm = client.get_fsm_state()
     log.info(f"当前 FSM: {fsm.value}")
