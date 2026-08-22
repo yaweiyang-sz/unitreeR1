@@ -98,6 +98,9 @@ class _RealR1Client:
         # 必须在 enter_locomotion() 之后, move() 才会真发到 R1
         # 避免在 Stance 下误发 SetVelocity 让 R1 固件进异常状态
         self._in_locomotion: bool = False
+        # 我们本地跟踪的 R1 FSM 状态 (用于安全门, 不真去问 R1)
+        # 默认 UNKNOWN, 每次调 enter_locomotion/exit_locomotion/damp/ZeroTorque 都会更新
+        self._known_fsm: R1FsmState = R1FsmState.UNKNOWN
         # poll_fsm 默认关闭 — 防止 GetFsmId RPC 把 R1 固件弄坏
         # 想开就调 enable_poll_fsm() 或设环境变量 R1_ENABLE_POLL_FSM=1
         self._enable_poll_fsm: bool = _env_flag("R1_ENABLE_POLL_FSM", False)
@@ -264,11 +267,24 @@ class _RealR1Client:
         log.warning("→ Start()  进入 locomotion  (FSM 811) — 危险操作, 请确认安全")
         self._loco.Start()
         self._in_locomotion = True
+        self._known_fsm = R1FsmState.RUNNING
         time.sleep(0.3)  # 给 FSM 切换一点时间
 
     def exit_locomotion(self) -> None:
-        """退出 locomotion: 先停速度, 再回 stance (FSM 4)。"""
+        """退出 locomotion: 先停速度, 再回 stance (FSM 4)。
+
+        ⚠️ 安全门: 如果我们本地跟踪到 R1 在 ZERO_TORQUE 模式 (FSM 0), 拒绝发
+        Stance() — ZERO_TORQUE 状态下 R1 电机零力矩, 软件方式不能直接切到
+        Stance (R1 端会进未定义状态), 只能 power cycle 恢复。
+        """
         if not self._loco:
+            return
+        # 安全门: ZeroTorque 状态拒绝切 Stance
+        if self._known_fsm == R1FsmState.ZERO_TORQUE:
+            log.error(
+                "  !!!!! exit_locomotion() 拒绝执行 — R1 当前在 ZERO_TORQUE (FSM 0) !!!!!\n"
+                "  ZERO_TORQUE 状态下 R1 电机零力矩, 软件无法切到 Stance, 必须 power cycle R1 恢复"
+            )
             return
         try:
             # 只有在 locomotion 状态才发 StopMove, 避免 Stance 下误发
@@ -278,6 +294,7 @@ class _RealR1Client:
             pass
         try:
             self._loco.Stance()
+            self._known_fsm = R1FsmState.STAND
             log.info("→ Stance()  (FSM 4) 退出 locomotion")
         except Exception as e:  # noqa: BLE001
             log.warning(f"Stance() 失败: {e}")
@@ -288,7 +305,8 @@ class _RealR1Client:
 
         ⚠️ 极度危险: 历史上 R1 固件在 Damp 状态下 DDS 响应会让 cyclonedds
         segfault, 且没有软件方式能让 R1 恢复, 必须物理 power cycle。
-        默认拒绝调用, 必须显式 force=True 才能执行。"""
+        默认拒绝调用, 必须显式 force=True 才能执行。
+        """
         assert self._loco, "未初始化"
         if not force:
             log.error(
@@ -299,6 +317,20 @@ class _RealR1Client:
         log.warning("→ Damp()  (FSM 1) 切断电机 — R1 会瘫软且只能 power cycle 恢复")
         self._loco.Damp()
         self._in_locomotion = False
+        self._known_fsm = R1FsmState.DAMP
+
+    def zero_torque(self) -> None:
+        """切到 ZeroTorque (FSM 0) — 电机零力矩, 自由落体。
+
+        ⚠️ 极度危险, 跟 damp 类似。R1 在 ZeroTorque 状态下软件不能切到 Stance,
+        必须 power cycle 恢复。默认还是允许调 (因为 ZeroTorque 是 R1 官方支持的
+        状态, 而 Damp 是"切电机"那种), 但调用后会锁住后续的 Stance 操作。
+        """
+        assert self._loco, "未初始化"
+        log.warning("→ ZeroTorque()  (FSM 0) 电机零力矩 — 后续 Stance 调用会被拒绝")
+        self._loco.ZeroTorque()
+        self._in_locomotion = False
+        self._known_fsm = R1FsmState.ZERO_TORQUE
 
     def stand_up_from_lie(self) -> None:
         """从躺姿站起 (FSM 701)。"""
@@ -432,6 +464,7 @@ class _DryRunR1Client:
     def __init__(self, network_iface: str, sport_state_topic: str = SPORT_STATE_TOPIC_DEFAULT):
         self.iface = network_iface
         self._fsm = R1FsmState.STAND
+        self._known_fsm = R1FsmState.STAND  # dry-run 假设 R1 一直在 Stance, 由方法更新
         self._in_locomotion = False  # 与 _RealR1Client 一致
         self._enable_poll_fsm: bool = _env_flag("R1_ENABLE_POLL_FSM", False)
         self._state = {
@@ -461,12 +494,20 @@ class _DryRunR1Client:
 
     def enter_locomotion(self) -> None:
         self._fsm = R1FsmState.RUNNING
+        self._known_fsm = R1FsmState.RUNNING
         self._in_locomotion = True
         log.info("[DRY-RUN] Start()  → RUNNING")
 
     def exit_locomotion(self) -> None:
+        # 安全门: 跟 _RealR1Client 一样, ZeroTorque 状态拒绝切 Stance
+        if self._known_fsm == R1FsmState.ZERO_TORQUE:
+            log.error(
+                "  !!!!! [DRY-RUN] exit_locomotion() 拒绝 — 当前 ZeroTorque !!!!!"
+            )
+            return
         self._last_cmd = (0.0, 0.0, 0.0)
         self._fsm = R1FsmState.STAND
+        self._known_fsm = R1FsmState.STAND
         self._in_locomotion = False
         # 清掉 stale velocity, 避免退出后 UI 看着还在动
         self._state["velocity"] = [0.0, 0.0, 0.0]
@@ -480,8 +521,15 @@ class _DryRunR1Client:
             )
             return
         self._fsm = R1FsmState.DAMP
+        self._known_fsm = R1FsmState.DAMP
         self._in_locomotion = False
         log.info("[DRY-RUN] Damp() (force=True)")
+
+    def zero_torque(self) -> None:
+        self._fsm = R1FsmState.ZERO_TORQUE
+        self._known_fsm = R1FsmState.ZERO_TORQUE
+        self._in_locomotion = False
+        log.info("[DRY-RUN] ZeroTorque() — 后续 Stance 调用会被拒绝")
 
     def stand_up_from_lie(self) -> None:
         self._fsm = R1FsmState.STAND
@@ -574,6 +622,17 @@ class R1Client:
 
     def damp(self, force: bool = False) -> None:
         self._impl.damp(force=force)
+
+    def zero_torque(self) -> None:
+        self._impl.zero_torque()
+
+    def set_known_fsm(self, fsm: R1FsmState) -> None:
+        """外部 (比如订阅 SportModeState 的回调) 可以告诉 R1Client 当前 FSM,
+        让 exit_locomotion 的安全门基于真实状态做判断, 不只是本地跟踪。
+        """
+        self._impl._known_fsm = fsm
+        # 顺便: 已知 FSM 也能更新 _in_locomotion (RUNNING 时 = True, 其他 = False)
+        self._impl._in_locomotion = (fsm == R1FsmState.RUNNING)
 
     def stand_up_from_lie(self) -> None:
         self._impl.stand_up_from_lie()

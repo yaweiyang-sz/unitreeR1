@@ -13,6 +13,11 @@
     2. 戴好护具, 急停按钮在手
     3. 跑完一定要 power cycle R1 才能再跑其他 example
 
+== 内置安全门 (在 R1Client.exit_locomotion() 内部) ==
+    如果本地跟踪到 R1 在 ZERO_TORQUE (FSM 0), 拒绝切 Stance。
+    ZERO_TORQUE 状态 R1 软件不能切回 Stance, 必须 power cycle 恢复。
+    通过 R1Client.set_known_fsm(R1FsmState.ZERO_TORQUE) 显式标记。
+
 == 跟 A 方案的差异 (一行就能切) ==
 A 方案 (你最初提的, 危险): STOP → damp, BACKWARD → exit_locomotion
 要看 A: 把 GESTURE_TO_STATE 那个 dict 里的 value 对调就行
