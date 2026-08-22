@@ -1,8 +1,11 @@
-"""SDK 集成测试 2: 视频流 (从机器人前置摄像头取 1 帧)。
+"""SDK 集成测试 2: 视频流 (从机器人前置摄像头取帧)。
+
+R1 没有自己的 video_client, 走 unitree_sdk2py.go2.video.video_client.VideoClient
+(因为 Go2 与 R1 共用同一套 video_service, 都是 GetImageSample RPC)。
 
 用法:
-    python3 scripts/test_video_stream.py eth0            # 真机
-    python3 scripts/test_video_stream.py eth0 --preview # OpenCV 窗口预览
+    python3 scripts/test_video_stream.py eth0
+    python3 scripts/test_video_stream.py eth0 --preview
     python3 scripts/test_video_stream.py eth0 --save out.jpg
 """
 from __future__ import annotations
@@ -44,7 +47,7 @@ def main() -> int:
     code, data = client.get_image()
     if code != 0 or data is None:
         log.error(f"取帧失败 code={code}, data len={len(data) if data else 0}")
-        log.error("检查: 1) 视频服务是否启用 2) 机器人是否在调试模式")
+        log.error("检查: 1) 视频服务是否启用 (App -> 设置 -> 视频) 2) 机器人是否在调试模式")
         client.shutdown()
         return 2
     arr = np.frombuffer(data, dtype=np.uint8)
@@ -70,7 +73,8 @@ def main() -> int:
                 arr = np.frombuffer(data, dtype=np.uint8)
                 f = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if f is not None:
-                    cv2.putText(f, f"FPS preview n={n}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    cv2.putText(f, f"R1 camera preview n={n}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                     cv2.imshow("R1 Camera", f)
                     n += 1
             if cv2.waitKey(30) & 0xFF == 27:

@@ -1,27 +1,39 @@
 """主控: 状态机把 视觉 → 决策 → 机器人 串起来。
 
+R1 生命周期 (FSM):
+    boot → initialize (DDS + clients)
+         → enter_locomotion (FSM 811, 需 --enable-loco 确认)
+         → GESTURE / FOLLOW  (持续发 Move)
+         → exit_locomotion (FSM 4, Stance)  ←  任何退出路径
+
+    ⚠️ 不传 --enable-loco 不会真正进入 locomotion, 机器人会停在 Stance,
+       整个流程只会本地跑视觉 + 把 Move 命令打到 DDS, 但 LocoClient 会被
+       真实 robot 拒收 (因为不在 FSM 811)。这是干跑/调试用的安全模式。
+
 状态:
     BOOT       启动, 加载各模块
-    IDLE       等待, 不发任何指令 (机器人 BalanceStand)
+    IDLE       等待进入 GESTURE/FOLLOW (默认)
     GESTURE    手势控制 (默认)
     FOLLOW     跟随模式
-    STOPPED    急停 (按键 'q' / ESC, 或电池过低)
+    STOPPED    急停 (按键 'q' / ESC)
     ERROR      出错, 准备退出
 
 切换:
     GESTURE 中持续识别到 STOP 超过 N 秒 -> FOLLOW
     FOLLOW 中识别到 BACKWARD (拳头) -> 回到 GESTURE
-    任意状态按 'q' / ESC -> STOPPED
+    任意状态按 'q' / ESC -> STOPPED → exit_locomotion
 
 视频源:
-    1) 优先 R1 前置摄像头 (通过 SDK)
+    1) 优先 R1 前置摄像头 (通过 Go2 VideoClient 复用)
     2) 失败 / dry-run -> 本机 USB 摄像头 (index 0)
     3) 都没有 -> 报错退出
 
 运行:
-    python3 src/main.py eth0                  # 真机
-    python3 src/main.py eth0 --dry-run        # 模拟 (用本机摄像头)
-    python3 src/main.py eth0 --no-window      # 不要 OpenCV 窗口
+    python3 src/main.py eth0                      # 真机 (默认干跑, 不让机器人走)
+    python3 src/main.py eth0 --enable-loco       # 真机 + 真的进入 locomotion
+    python3 src/main.py eth0 --dry-run           # 完全模拟
+    python3 src/main.py eth0 --no-window         # 服务器模式
+    python3 src/main.py eth0 --follow            # 启动后直接进 FOLLOW
 """
 from __future__ import annotations
 
@@ -76,6 +88,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-window", action="store_true", help="不显示 OpenCV 窗口 (服务器环境)")
     p.add_argument("--webcam", type=int, default=0, help="fallback USB 摄像头 index")
     p.add_argument("--follow", action="store_true", help="启动后默认进入跟随模式")
+    p.add_argument(
+        "--enable-loco",
+        action="store_true",
+        help="真机模式下, 显式让机器人进入 locomotion (FSM 811)。不传则停在 Stance。",
+    )
+    p.add_argument(
+        "--enter-loco-now",
+        action="store_true",
+        help="跳过 '按 Enter 确认' 提示, 直接进 locomotion (脚本场景)。",
+    )
+    p.add_argument(
+        "--sport-state-topic",
+        default=None,
+        help="覆盖 SportModeState_ 订阅主题, 默认 rt/sportmodestate",
+    )
     return p.parse_args()
 
 
@@ -114,12 +141,32 @@ def main() -> int:
 
     iface = args.iface or get(cfg, "robot.network_interface", "eth0")
     mode = R1Mode.DRY_RUN if args.dry_run else R1Mode.REAL
-    robot = R1Client(iface, mode=mode)
+    sport_topic = args.sport_state_topic or get(cfg, "robot.sport_state_topic", "rt/sportmodestate")
+    robot = R1Client(iface, mode=mode, sport_state_topic=sport_topic)
     state = State.BOOT
+
+    # 是否让真实机器人真的进 locomotion
+    will_enter_loco = (
+        (not args.dry_run)
+        and (args.enable_loco or get(cfg, "robot.auto_enter_locomotion", False))
+    )
+    if will_enter_loco and not args.enter_loco_now:
+        log.warning("即将让 R1 进入 locomotion (FSM 811) — 这是危险操作")
+        log.warning("确认条件: 支架悬吊 / 周围 ≥ 2m / 急停按钮在握")
+        try:
+            input("按 Enter 继续, Ctrl-C 取消...")
+        except KeyboardInterrupt:
+            log.info("用户取消, 不进入 locomotion")
+            will_enter_loco = False
 
     try:
         robot.initialize()
         state = State.IDLE
+
+        if will_enter_loco:
+            robot.enter_locomotion()
+        else:
+            log.info("[safe-mode] 不进入 locomotion, 机器人将停在 Stance (FSM 4)")
 
         # 视觉模块
         gesture_det = HandGestureDetector()
@@ -257,6 +304,8 @@ def main() -> int:
                 "src": src_name,
                 "iface": iface,
                 "dry": "yes" if robot.is_dry_run else "no",
+                "fsm": robot.get_fsm_state().value,
+                "loco": "on" if will_enter_loco else "off",
                 "cmd": f"({send_vx:+.2f},{send_vy:+.2f},{send_vyaw:+.2f})",
             }
             draw_telemetry(frame, cur_fps, state.value, extra)
@@ -277,10 +326,16 @@ def main() -> int:
         log.exception(f"主循环异常: {e}")
         return 2
     finally:
+        # 退出顺序: 停速度 → Stance (FSM 4) → 关 DDS
         try:
             robot.stop_move()
         except Exception:  # noqa: BLE001
             pass
+        if will_enter_loco and not robot.is_dry_run:
+            try:
+                robot.exit_locomotion()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             robot.shutdown()
         except Exception:  # noqa: BLE001

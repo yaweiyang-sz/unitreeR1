@@ -5,9 +5,16 @@
 robot:
   # 网络接口名（Jetson Nano 与 R1 通过网线直连时的网卡名）
   # 实际名以 `ip a` 看到的为准，常见: eth0, enp0s3, eno1
+  # ChannelFactoryInitialize(0, interface) 会把这个网卡作为 DDS 出口
   network_interface: "eth0"
   # 机器人机载 PC2 (Jetson Nano) IP，调试用
   onboard_pc_ip: "192.168.123.164"
+  # SportModeState_ DDS 订阅主题 (rt/sportmodestate 与 Go2 一致;
+  # 新版固件用 rt/lf/sportmodestate, sdk_client 会自动 fallback)
+  sport_state_topic: "rt/sportmodestate"
+  # 是否在启动后让机器人真的进入 locomotion (FSM 811)。
+  # 强烈建议保持 false, 用 CLI --enable-loco 显式触发。
+  auto_enter_locomotion: false
 
 # 手势识别
 gesture:

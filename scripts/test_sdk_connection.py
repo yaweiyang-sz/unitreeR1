@@ -1,7 +1,11 @@
-"""SDK 集成测试 1: 网络/状态/运控 (高层)。
+"""SDK 集成测试 1: 网络 / 状态 / 运控 (高层)。
+
+按 R1 LocoClient 的真实 FSM 流程跑, 默认不在 Stance 之外发移动指令。
+要看机器人真的动起来, 加 --enter-loco (会要求二次确认)。
 
 用法:
-    python3 scripts/test_sdk_connection.py eth0
+    python3 scripts/test_sdk_connection.py eth0             # 只测连接 + 状态
+    python3 scripts/test_sdk_connection.py eth0 --enter-loco # Stance -> Start -> Move -> Stance
     python3 scripts/test_sdk_connection.py eth0 --dry-run
 """
 from __future__ import annotations
@@ -14,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.logger import setup_logger
-from src.robot.sdk_client import R1Client, R1Mode
+from src.robot.sdk_client import R1Client, R1FsmState, R1Mode
 
 log = setup_logger("test.sdk")
 
@@ -23,50 +27,111 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("iface", nargs="?", default="eth0")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--no-move", action="store_true", help="只测连接和读状态, 不发移动指令")
+    p.add_argument(
+        "--enter-loco",
+        action="store_true",
+        help="进入 locomotion (FSM 811) 跑 Move/Stance 完整流程",
+    )
+    p.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过 enter-loco 的二次确认 (脚本场景)",
+    )
+    p.add_argument(
+        "--sport-state-topic",
+        default="rt/sportmodestate",
+        help="SportModeState_ DDS 主题",
+    )
     args = p.parse_args()
 
     mode = R1Mode.DRY_RUN if args.dry_run else R1Mode.REAL
-    client = R1Client(args.iface, mode=mode)
+    client = R1Client(args.iface, mode=mode, sport_state_topic=args.sport_state_topic)
 
-    log.info("==== SDK 集成测试 ====")
-    log.info(f"模式: {mode.value}, 网卡: {args.iface}")
+    log.info("==== SDK 集成测试 (R1 LocoClient) ====")
+    log.info(f"模式: {mode.value}  网卡: {args.iface}  状态主题: {args.sport_state_topic}")
     try:
         client.initialize()
     except Exception as e:  # noqa: BLE001
         log.error(f"初始化失败: {e}")
-        log.error("检查: 1) 机器人是否开机 2) 网线/WiFi 是否通 3) 网卡名是否正确")
+        log.error("检查: 1) 机器人是否开机 2) App 切到调试模式 3) 网卡名对 4) cyclonedds 安装")
         return 1
 
     log.info("✓ 初始化成功")
 
-    # 读状态
+    # 等 0.5s 让 SportModeState 订阅跑一两帧
+    time.sleep(0.5)
     st = client.get_state()
     if st:
-        log.info(f"✓ 读到状态: {st}")
+        log.info(
+            f"✓ 读到状态: mode={st.get('mode')}, pos={st.get('position')}, "
+            f"vel={st.get('velocity')}, imu_rpy={st.get('imu_rpy')}"
+        )
     else:
-        log.warning("读不到状态 (不影响运控, 可忽略)")
+        log.warning("读不到状态 (订阅未触发, 正常 1Hz 慢发, 稍等即可)")
 
-    if not args.no_move and not args.dry_run:
-        try:
-            log.info("→ StandUp")
-            client.stand_up()
-            time.sleep(2.0)
-            log.info("→ BalanceStand")
-            client.balance_stand()
-            time.sleep(1.0)
+    fsm = client.get_fsm_state()
+    log.info(f"当前 FSM: {fsm.value}")
+
+    if not args.enter_loco or args.dry_run:
+        if args.dry_run:
+            log.info("[DRY-RUN] 模拟进入 locomotion")
+            client.enter_locomotion()
+            time.sleep(0.3)
             log.info("→ Move(0.2, 0, 0) x 1.0s")
             client.move(0.2, 0, 0)
             time.sleep(1.0)
             log.info("→ StopMove")
             client.stop_move()
-            time.sleep(0.5)
-        except Exception as e:  # noqa: BLE001
-            log.error(f"运控异常: {e}")
-            return 2
+            time.sleep(0.2)
+            client.exit_locomotion()
+        else:
+            log.info("跳过 locomotion (用 --enter-loco 才会让机器人走)")
+        client.shutdown()
+        log.info("==== 完成 ====")
+        return 0
+
+    # 真实进入 locomotion — 危险, 二次确认
+    if not args.yes:
+        log.warning("即将让 R1 进入 locomotion (FSM 811) — 危险操作")
+        log.warning("确认: 1) 周围 ≥ 2m  2) 急停按钮在手  3) 机器人已用支架保护")
+        try:
+            input("按 Enter 继续, Ctrl-C 取消...")
+        except KeyboardInterrupt:
+            log.info("用户取消")
+            client.shutdown()
+            return 0
+
+    try:
+        client.enter_locomotion()
+        # 给 FSM 切换一点时间, 等订阅回包
+        time.sleep(0.5)
+        log.info(f"FSM after Start: {client.get_fsm_state().value}")
+
+        log.info("→ Move(0.2, 0, 0) x 1.0s")
+        client.move(0.2, 0, 0)
+        time.sleep(1.0)
+
+        log.info("→ Move(0, 0, 0.3)  x 1.0s")
+        client.move(0, 0, 0.3)
+        time.sleep(1.0)
+
+        log.info("→ StopMove")
+        client.stop_move()
+        time.sleep(0.5)
+
+        log.info("→ exit_locomotion (Stance)")
+        client.exit_locomotion()
+        time.sleep(0.5)
+        log.info(f"FSM after Stance: {client.get_fsm_state().value}")
         log.info("✓ 运控测试通过")
-    else:
-        log.info("跳过移动指令 (--no-move 或 dry-run)")
+    except Exception as e:  # noqa: BLE001
+        log.exception(f"运控异常: {e}")
+        try:
+            client.exit_locomotion()
+        except Exception:  # noqa: BLE001
+            pass
+        client.shutdown()
+        return 2
 
     client.shutdown()
     log.info("==== 完成 ====")

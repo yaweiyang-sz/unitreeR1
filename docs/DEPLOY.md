@@ -37,8 +37,11 @@ python3 -m pip --version
 
 ### 1.1 安装 unitree_sdk2_python (从源码)
 
+R1 EDU 走的是 SDK2 的 R1 分支，路径是 `unitree_sdk2py.r1.loco.r1_loco_client.LocoClient`。
+视频是 Go2 路径 `unitree_sdk2py.go2.video.video_client.VideoClient`（R1 没有自己的 video_client，复用 Go2 的）。
+
 ```bash
-# 1. 安装 cyclonedds 0.10.2
+# 1. 安装 cyclonedds 0.10.x
 sudo apt update
 sudo apt install -y build-essential cmake git
 
@@ -65,6 +68,13 @@ pip3 install -e .
 cd ~
 ```
 
+> 验证 SDK 装好且模块路径对:
+> ```bash
+> python3 -c "from unitree_sdk2py.r1.loco.r1_loco_client import LocoClient; print('r1 loco ok')"
+> python3 -c "from unitree_sdk2py.go2.video.video_client import VideoClient; print('go2 video ok')"
+> python3 -c "from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_; print('SportModeState ok')"
+> ```
+
 ### 1.2 安装 OpenCV + MediaPipe
 
 ```bash
@@ -79,7 +89,7 @@ pip3 install mediapipe==0.10.18
 
 ### 1.3 部署项目代码
 
-**方法 A: 用脚本同步 (推荐)**
+**方法 A: 用 git 同步 (推荐)**
 
 在你的开发机 (Windows + Git Bash / WSL) 上:
 
@@ -120,6 +130,7 @@ rsync -avz --exclude '__pycache__' --exclude '.git' \
 2. 找到 R1 蓝牙 → 连接
 3. 切换到"调试模式" / "开发者模式"（具体名称以 App 为准）
 4. App 上应该显示 PC1/PC2 的 IP
+5. **进调试模式后, 机器人应在 FSM 4 (Stance) —— 不动, 保持平衡站立**
 
 ## 3. 验证 SDK 集成 (按顺序跑)
 
@@ -127,8 +138,11 @@ rsync -avz --exclude '__pycache__' --exclude '.git' \
 ssh unitree@192.168.123.164
 cd ~/unitreeR1
 
-# 测试 1: SDK 连接 + 简单运控 (机器人会站起来/小步前进)
+# 测试 1: 仅连接 + 读状态 (不动机器人)
 python3 scripts/test_sdk_connection.py eth0
+
+# 测试 1b: 跑完整 FSM 流程 (机器人会真的走两步, 需要支架 + 周围 ≥ 2m)
+python3 scripts/test_sdk_connection.py eth0 --enter-loco --yes
 
 # 测试 2: 视频流
 python3 scripts/test_video_stream.py eth0 --save frame.jpg
@@ -144,33 +158,46 @@ python3 scripts/test_pose_webcam.py
 - 确认 R1 已开机 + 在调试模式
 - `ifconfig` 看你 PC2 的网卡名 (常见 `eth0`、`enp0s3`)，把命令里的 `eth0` 换成实际名字
 - 确认机器人和 PC2 在同一网段: `ping 192.168.123.161`
+- 确认 cyclonedds 安装: `python3 -c "import cyclonedds; print(cyclonedds.__version__)"`
 
 ## 4. 启动主控
 
 ```bash
+# 默认: 真机, 但不进入 locomotion (机器人停在 Stance, 只有视频/视觉流跑通)
 python3 src/main.py eth0
+
+# 真机 + 真的进入 locomotion (会要求按 Enter 二次确认)
+python3 src/main.py eth0 --enable-loco
+
 # 服务器环境 (没显示器):
 python3 src/main.py eth0 --no-window
+
 # 调试 (用本机 USB 摄像头, 不连机器人):
 python3 src/main.py eth0 --dry-run
+
+# 启动后直接进 FOLLOW 模式 (跳过手势):
+python3 src/main.py eth0 --enable-loco --follow
 ```
 
 主控启动后:
 - **OpenCV 窗口**: 直接看画面 (有显示器时)
 - **Web 浏览器**: 同一局域网的电脑/手机访问 `http://192.168.123.164:8080/`
 - 按 `q` 或 `ESC` 退出 / 急停
+- 退出时会自动 `StopMove() → Stance()`, 机器人会回到平衡站立
 
 ## 5. 故障排查
 
 | 现象 | 原因 | 解决 |
 |------|------|------|
 | `Could not locate cyclonedds` | 环境变量没设 | `export CYCLONEDDS_HOME=...` |
-| `Init` 超时 | 网络不通 / 没在调试模式 | 1) ping 161 2) 进 App 切调试模式 |
-| `ImportError: unitree_sdk2py` | SDK 没装 | 回到 1.1 |
+| `LocoClient.Init` 超时 | 网络不通 / 没在调试模式 | 1) ping 161 2) 进 App 切调试模式 |
+| `ImportError: unitree_sdk2py.r1.loco` | SDK 没装 / 装错分支 | `cd unitree_sdk2_python && pip3 install -e .` |
 | `cv2.imshow` 报错 | Jetson 无显示器 | 加 `--no-window` |
 | Web 流 8080 访问不到 | 防火墙 / 端口占用 | `sudo ufw allow 8080` 或换端口 |
 | 视频 `GetImageSample` 拿不到 | 摄像头服务没起 | App 里"开启视频" / 重启机器人 |
-| 机器人运控不动 | 高层运控没开 | App 切到调试模式 (sport_mode) |
+| 机器人不响应 Move | 没在 FSM 811 (RUNNING) | 加 `--enable-loco` 或 config 打开 auto_enter_locomotion |
+| 状态一直 unknown | 订阅主题名不对 | 用 `--sport-state-topic rt/lf/sportmodestate` 试一下 |
+| 机器人走动 1s 后停 | 没设 `continous_move=True` (SDK 客户端 bug) | 确认用的是我们改过的 sdk_client.py |
 
 详见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
