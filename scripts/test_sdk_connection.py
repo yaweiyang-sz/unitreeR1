@@ -70,10 +70,11 @@ def main() -> int:
             f"vel={st.get('velocity')}, imu_rpy={st.get('imu_rpy')}"
         )
     else:
-        log.warning("3s 内没读到状态 — 主题名可能不对, 试试 --sport-state-topic rt/lf/sportmodestate")
+        log.warning("3s 内没读到 SportModeState — 主题名可能不对, 但 FSM 仍可通过 RPC 拿")
 
-    fsm = client.get_fsm_state()
-    log.info(f"当前 FSM: {fsm.value}")
+    # 主路径: 主动 RPC 拉一次 FSM
+    fsm = client.poll_fsm()
+    log.info(f"当前 FSM (via LocoClient.GetFsmId RPC): {fsm.value}")
 
     if not args.enter_loco or args.dry_run:
         if args.dry_run:
@@ -106,9 +107,9 @@ def main() -> int:
 
     try:
         client.enter_locomotion()
-        # 给 FSM 切换一点时间, 等订阅回包
+        # 给 FSM 切换一点时间, RPC 拉一次确认
         time.sleep(0.5)
-        log.info(f"FSM after Start: {client.get_fsm_state().value}")
+        log.info(f"FSM after Start: {client.poll_fsm().value}")
 
         log.info("→ Move(0.2, 0, 0) x 1.0s")
         client.move(0.2, 0, 0)
@@ -125,7 +126,7 @@ def main() -> int:
         log.info("→ exit_locomotion (Stance)")
         client.exit_locomotion()
         time.sleep(0.5)
-        log.info(f"FSM after Stance: {client.get_fsm_state().value}")
+        log.info(f"FSM after Stance: {client.poll_fsm().value}")
         log.info("✓ 运控测试通过")
     except Exception as e:  # noqa: BLE001
         log.exception(f"运控异常: {e}")

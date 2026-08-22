@@ -120,21 +120,35 @@ class _RealR1Client:
         else:
             log.info("VideoClient.Init() ✓")
 
-        # ---- 状态订阅 ----
+        # ---- 状态: 主路径 LocoClient RPC GetFsmId() (必拿得到, 已通过 Init 验证通道)
+        #      副路径 ChannelSubscriber(SportModeState_) 仅用于富信息 (IMU/位置/速度);
+        #      主题名找不到就静默降级, 不阻塞初始化 ----
+        # 主动拉一次 FSM 状态, 让 fsm 立刻有值
+        self._refresh_fsm_via_rpc()
+        # DDS 订阅 (best-effort)
         try:
             self._state_sub = ChannelSubscriber(self.sport_state_topic, SportModeState_)
             self._state_sub.Init(self._on_sport_state, 10)
             log.info(f"SportModeState 订阅 ✓  topic={self.sport_state_topic}")
         except Exception as e:  # noqa: BLE001
-            # 部分新固件用 lf 前缀, 退到 alt
             if self.sport_state_topic != SPORT_STATE_TOPIC_ALT:
                 log.warning(f"订阅 {self.sport_state_topic} 失败 ({e}), 尝试 {SPORT_STATE_TOPIC_ALT}")
-                self.sport_state_topic = SPORT_STATE_TOPIC_ALT
-                self._state_sub = ChannelSubscriber(self.sport_state_topic, SportModeState_)
-                self._state_sub.Init(self._on_sport_state, 10)
-                log.info(f"SportModeState 订阅 ✓  topic={self.sport_state_topic}")
+                try:
+                    self.sport_state_topic = SPORT_STATE_TOPIC_ALT
+                    self._state_sub = ChannelSubscriber(self.sport_state_topic, SportModeState_)
+                    self._state_sub.Init(self._on_sport_state, 10)
+                    log.info(f"SportModeState 订阅 ✓  topic={self.sport_state_topic}")
+                except Exception as e2:  # noqa: BLE001
+                    log.warning(
+                        f"alt 主题 {SPORT_STATE_TOPIC_ALT} 也订阅失败 ({e2}), "
+                        f"SportModeState 订阅降级 — 富信息 (IMU/位置) 暂不可用, FSM 仍可读"
+                    )
+                    self._state_sub = None
             else:
-                raise
+                log.warning(
+                    f"SportModeState 订阅降级 — 富信息 (IMU/位置) 暂不可用, FSM 仍可读: {e}"
+                )
+                self._state_sub = None
 
         self._connected = True
         log.info("R1 客户端就绪 (尚未进入 locomotion)")
@@ -158,13 +172,39 @@ class _RealR1Client:
                     else [0.0, 0.0, 0.0]
                 ),
             }
+            # DDS 拿到的 mode 跟 FSM id 同空间 (4=stance, 811=running), 一并缓存
             self._fsm_state = _mode_to_fsm(self._last_state["mode"])
+
+    def _refresh_fsm_via_rpc(self) -> None:
+        """通过 LocoClient.GetFsmId() RPC 拉一次当前 FSM id。
+        这是**主路径**, 通道已通过 LocoClient.Init() 验证。
+        返回值形如 {"data": <fsm_id>} (与 SetFsmId 互为反向)。
+        """
+        if not self._loco:
+            return
+        try:
+            import json as _json
+            code, data = self._loco._Call(7001, "{}")  # ROBOT_API_ID_LOCO_GET_FSM_ID
+            if code == 0 and data:
+                d = _json.loads(data) if isinstance(data, (str, bytes)) else data
+                fsm_id = d.get("data") if isinstance(d, dict) else None
+                if fsm_id is not None:
+                    with self._state_lock:
+                        self._fsm_state = _mode_to_fsm(int(fsm_id))
+                        self._last_state["mode"] = int(fsm_id)
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"GetFsmId RPC 失败: {e}")
 
     # ---- 状态机高层操作 ----
 
     def get_fsm_state(self) -> R1FsmState:
         with self._state_lock:
             return self._fsm_state
+
+    def poll_fsm(self) -> R1FsmState:
+        """主动通过 RPC 拉一次 FSM (DDS 订阅没建好或主程序需要确认时用)。"""
+        self._refresh_fsm_via_rpc()
+        return self.get_fsm_state()
 
     def enter_locomotion(self) -> None:
         """进入 locomotion 模式 (FSM 811)。
@@ -319,6 +359,9 @@ class _DryRunR1Client:
     def get_fsm_state(self) -> R1FsmState:
         return self._fsm
 
+    def poll_fsm(self) -> R1FsmState:
+        return self._fsm
+
     def enter_locomotion(self) -> None:
         self._fsm = R1FsmState.RUNNING
         log.info("[DRY-RUN] Start()  → RUNNING")
@@ -441,6 +484,9 @@ class R1Client:
 
     def get_fsm_state(self) -> R1FsmState:
         return self._impl.get_fsm_state()
+
+    def poll_fsm(self) -> R1FsmState:
+        return self._impl.poll_fsm()
 
     def get_image(self) -> tuple[int, Optional[bytes]]:
         return self._impl.get_image()
