@@ -416,9 +416,16 @@ class _RealR1Client:
     def move(self, vx: float, vy: float, vyaw: float) -> None:
         """设置运动速度 (m/s, rad/s)。
 
-        R1 LocoClient 的 Move(vx, vy, vyaw, continous_move=False) 默认 1 秒后自动停。
-        我们的控制循环是周期性的 (默认 30 Hz), 所以用 continous_move=True 保持持续。
-        如果你只是想"踩一下油门"再放手, 传一个 < 1.0s 的 duration, 这里不暴露 — 都在外面用速度表达。
+        === 行为参考 R1 high_level 官方 example (D:\\workspace\\unitree_sdk2_python\\example\\r1\\high_level\\r1_loco_client_example.py) ===
+        官方例子用的是 `sport_client.Move(1.0, 0, 0)`,**不传**第 4 个参数,即
+        `continous_move=False` → `duration=1.0`(走 1 秒自动停)。
+        官方例子的"持续走"靠的是**外部循环周期性重发**(Go2 也是这种模式)。
+
+        我们也用同样的写法:
+        - 主循环 30 Hz,每 33ms 重发一次 → 速度一直保持
+        - SDK 内部 `duration=1.0` 兜底,主循环卡 1s 也会自动停 → 安全性更好
+        - 不传 `continous_move=True`(即 `duration=864000.0`), 那个特殊值在 R1
+          固件上**疑似被静默丢弃**, 实测症状是 "腿有反应但没位移"
 
         ⚠️ 安全门: 没调 enter_locomotion() 之前, 这个方法是 **no-op**。
         原因是 R1 在 Stance (FSM 4) 下收到 SetVelocity 是未定义行为, 历史上会把
@@ -435,7 +442,9 @@ class _RealR1Client:
             return
         with self._lock:
             try:
-                self._loco.Move(vx, vy, vyaw, True)  # continous_move=True
+                # 跟 r1 high_level 官方一致: 不传 continous_move (即默认 False)
+                # duration=1.0, 我们 30Hz 循环会持续重发
+                self._loco.Move(vx, vy, vyaw)
             except Exception as e:  # noqa: BLE001
                 log.debug(f"Move 异常: {e}")
 

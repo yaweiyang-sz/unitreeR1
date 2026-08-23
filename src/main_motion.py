@@ -23,17 +23,18 @@ main.py 留作只切状态/不发速度的安全版本, 本程序加上"走两�
         所以最后必须停在 Start 模式 + 速度=0, 而不是 Stance。
 
 == 手势 → 运动 (走两步, 速度/时长都显式写死, 不读 config) ==
-    ✊  拳头 (BACKWARD) → 机器人向后走两步  (vx = -0.20 m/s × 1.2s)
+    ✊  拳头 (BACKWARD) → 机器人向后走两步  (vx = -0.30 m/s × 1.5s)
     ✋  手掌 (STOP)     → 原地站住           (vx=0, vy=0, vyaw=0, 保持 Locomotion)
-    ☝️  食指 (FORWARD)  → 机器人向前走两步  (vx = +0.20 m/s × 1.2s)
+    ☝️  食指 (FORWARD)  → 机器人向前走两步  (vx = +0.30 m/s × 1.5s)
 
     ⚠️ 防连续: 一次前进/后退完成后, 必须中间出现一次 STOP 才能再做下一次前进/后退。
                 防止用户"拳头 → 食指" 或 "食指 → 拳头" 连续触发。
 
 == 显式参数 (顶部, 调这里) ==
-    WALK_SPEED       = 0.20 m/s
-    WALK_DURATION    = 1.2  s      (≈ 0.24m ≈ 2 步, R1 SDK 没步数指令, 用速度×时间)
-    DEBOUNCE_FRAMES  = 6          (跟 main.py 一致)
+    WALK_SPEED       = 0.30 m/s     (跟 Go2 high_level 官方例子 0.3 一致; R1 high_level 例子 1.0 偏激进)
+    WALK_DURATION    = 1.5  s       (≈ 0.45m, 给步态启动留余地)
+    STARTUP_DELAY    = 0.3  s       (开始 move 后, 前 0.3s 不算 WALK_DURATION, 等 R1 进入步态)
+    DEBOUNCE_FRAMES  = 6            (跟 main.py 一致)
 
 == 跑法 ==
     # Jetson 真机
@@ -70,9 +71,11 @@ log = setup_logger("r1.motion")
 # ============================================================
 #  显式参数 (不读 config, 改这里就行)
 # ============================================================
-# 运动参数
-WALK_SPEED = 0.20         # m/s, 走两步的线速度 (慢一点安全)
-WALK_DURATION = 1.2       # 秒, 走两步的持续时间 (≈ 0.24m, R1 单步 ≈ 10-12cm)
+# 运动参数 (参考 r1/high_level 官方 example 的速度量级)
+WALK_SPEED = 0.30         # m/s, 走两步的线速度 (跟 Go2 high_level 官方例子 0.3 一致)
+WALK_DURATION = 1.5       # 秒, 走两步的持续时间 (≈ 0.45m, R1 单步 ≈ 10-12cm)
+STARTUP_DELAY = 0.3       # 秒, 走两步开始后前 0.3s 不算 WALK_DURATION (等 R1 步态真的启动)
+DIAG_EVERY = 0.2          # 秒, 走两步过程中每 0.2s 打一次诊断 log (确认 move 真发了)
 
 # 启动序列时序 (每步切完等一会儿, 让 R1 内部状态稳定)
 ZERO_TORQUE_WAIT = 0.5    # ZeroTorque 后等 0.5s
@@ -169,28 +172,55 @@ class MotionController:
     防连续规则:
         一次前进/后退完成后 last_motion 被设为该手势, 下次前进/后退被忽略
         直到用户做一次 STOP, last_motion 重置为 STOP, 才解除
+
+    走两步时序 (实测 R1 步态启动有延迟, 直接 WALK_DURATION 计时会让步态还没动就停):
+        [0, STARTUP_DELAY)        : 起步期, 不算 WALK_DURATION, 让 R1 进入步态
+        [STARTUP_DELAY, STARTUP_DELAY+WALK_DURATION) : 正式走两步
+        [结束]                    : stop_move, 回 IDLE
     """
 
     def __init__(self, robot: R1Client):
         self.robot = robot
         self.state = AppState.IDLE
         self.last_motion: Optional[Gesture] = None
-        self.walk_start_t: float = 0.0
-        self.walk_dir: int = 0  # +1=前进, -1=后退
+        self.walk_start_t: float = 0.0   # 走两步开始的 monotonic 时间
+        self.walk_dir: int = 0            # +1=前进, -1=后退
+        self.last_diag_t: float = 0.0    # 上一次打诊断 log 的时间
+        self.move_count: int = 0          # 走两步期间发了几次 move (诊断用)
 
     def step(self, gesture: Gesture, now: float) -> str:
         """每帧调用一次. 返回一个状态字符串 (log 用)."""
         # ---- 走路阶段: 持续发速度, 走完回 IDLE ----
         if self.state == AppState.WALKING:
             elapsed = now - self.walk_start_t
-            if elapsed < WALK_DURATION:
-                self.robot.move(self.walk_dir * WALK_SPEED, 0.0, 0.0)
-                return f"walking(t={elapsed:.2f}s/{WALK_DURATION}s)"
+            if elapsed < STARTUP_DELAY + WALK_DURATION:
+                # 起步期内也发 move, 让 R1 早进入步态; 但 elapsed 还没进 WALK_DURATION
+                vx = self.walk_dir * WALK_SPEED
+                self.robot.move(vx, 0.0, 0.0)
+                self.move_count += 1
+
+                # 诊断: 每 DIAG_EVERY 秒打一次, 确认 move 真发了
+                if now - self.last_diag_t >= DIAG_EVERY:
+                    phase = "起步" if elapsed < STARTUP_DELAY else "走步"
+                    log.info(
+                        f"    [{phase}] move(vx={vx:+.2f}, vy=0.00, vyaw=0.00) "
+                        f"t={elapsed:.2f}s (move_count={self.move_count})"
+                    )
+                    self.last_diag_t = now
+
+                if elapsed < STARTUP_DELAY:
+                    return f"starting(t={elapsed:.2f}s/{STARTUP_DELAY:.1f}s)"
+                return f"walking(t={elapsed - STARTUP_DELAY:.2f}s/{WALK_DURATION}s)"
+
             # 走完了: 停
             self.robot.move(0.0, 0.0, 0.0)
             self.state = AppState.IDLE
             direction = "前进" if self.walk_dir > 0 else "后退"
-            log.info(f"  ✓ {direction}两步走完, 速度=0, 等下一次手势")
+            log.info(
+                f"  ✓ {direction}两步走完 (move_count={self.move_count}), "
+                f"速度=0, 等下一次手势"
+            )
+            self.move_count = 0  # 重置, 下一轮用
 
         # ---- 空闲阶段: 处理手势 ----
         if self.state == AppState.IDLE:
@@ -214,12 +244,14 @@ class MotionController:
                 # 通过防连续, 开始走两步
                 self.state = AppState.WALKING
                 self.walk_start_t = now
+                self.last_diag_t = now
+                self.move_count = 0
                 self.walk_dir = +1 if gesture == Gesture.FORWARD else -1
                 self.last_motion = gesture
                 direction = "前进" if self.walk_dir > 0 else "后退"
                 log.info(
                     f"  ▶ 开始{direction}: vx={self.walk_dir * WALK_SPEED:+.2f} m/s "
-                    f"× {WALK_DURATION}s"
+                    f"× {WALK_DURATION}s (起步 {STARTUP_DELAY}s)"
                 )
                 return f"started:{gesture.value}"
 
