@@ -4,17 +4,23 @@
 跟 src/main.py 的"安全测试版"分开, 专门调试"手势 → 运动"链路。
 main.py 留作只切状态/不发速度的安全版本, 本程序加上"走两步"运动。
 
-== 启动序列 (用户实测的合法路径) ==
-    1) ZeroTorque    (FSM 0)    零力矩, 软状态 (机器人被你放倒, 当前就是它)
-    2) Damp          (FSM 1)    切电机, 自由落体 — 状态机路径的必经步
-    3) Stance        (FSM 4)    锁定站立 (电机锁位置, 但不能抗扰动)
-    4) Start         (FSM 811)  进入 Locomotion (走跑模式)
-    5) Lie2StandUp   (FSM 701)  从躺姿站起来 (必须在 Start 模式下才能成功)
-    6) 速度=0                  动态稳定站立 — Start 模式 + 速度=0 才是"站稳"
+== 启动序列 (Damp 起手 — 上电默认就在 Damp) ==
+    1) Damp          (FSM 1)    切断电机 (上电默认状态, 显式切一次保证状态干净)
+    2) Stance        (FSM 4)    锁定站立 (电机锁位置, 但不能抗扰动)
+    3) Start         (FSM 811)  进入 Locomotion (走跑模式)
+    4) Lie2StandUp   (FSM 701)  从躺姿站起来 (必须在 Start 模式下才能成功)
+    5) 速度=0                  动态稳定站立 — Start 模式 + 速度=0 才是"站稳"
 
-    ⚠️ 状态机切换的合法路径 (用户遥控实测):
-        ZeroTorque → Damp → Stance → Start → Lie2StandUp
-        任何跳跃 (如 ZeroTorque → Lie2StandUp) 都会失败。
+    ⚠️ 为什么是 Damp 起手, 不是 ZeroTorque?
+        真实使用场景: 机器人先上电 (R1 上电默认就在 Damp, 电机被切),
+        程序启动时直接 ZeroTorque 会让电机"突然上电但零力矩",
+        腿会"突突"一下砸下来, 容易撞坏关节或摔坏机器人。
+        Damp 起手 → Stance → Start → Lie2StandUp, 电机重新使能的过程
+        是连续可控的 (Stance 锁位置, 不会砸)。
+
+    ⚠️ 状态机切换的合法路径:
+        Damp → Stance → Start → Lie2StandUp
+        任何跳跃 (如 Damp → Lie2StandUp) 都会失败。
         躺下来正好相反: Lie2StandUp ↔ StandUp2Lie (FSM 702) 都需要在 Start 模式。
 
     ⚠️ Stance vs Start 速度=0 的区别:
@@ -23,16 +29,16 @@ main.py 留作只切状态/不发速度的安全版本, 本程序加上"走两�
         所以最后必须停在 Start 模式 + 速度=0, 而不是 Stance。
 
 == 手势 → 运动 (走两步, 速度/时长都显式写死, 不读 config) ==
-    ✊  拳头 (BACKWARD) → 机器人向后走两步  (vx = -0.30 m/s × 1.5s)
+    ✊  拳头 (BACKWARD) → 机器人向后走两步  (vx = -0.50 m/s × 2.0s)
     ✋  手掌 (STOP)     → 原地站住           (vx=0, vy=0, vyaw=0, 保持 Locomotion)
-    ☝️  食指 (FORWARD)  → 机器人向前走两步  (vx = +0.30 m/s × 1.5s)
+    ☝️  食指 (FORWARD)  → 机器人向前走两步  (vx = +0.50 m/s × 2.0s)
 
     ⚠️ 防连续: 一次前进/后退完成后, 必须中间出现一次 STOP 才能再做下一次前进/后退。
                 防止用户"拳头 → 食指" 或 "食指 → 拳头" 连续触发。
 
 == 显式参数 (顶部, 调这里) ==
-    WALK_SPEED       = 0.30 m/s     (跟 Go2 high_level 官方例子 0.3 一致; R1 high_level 例子 1.0 偏激进)
-    WALK_DURATION    = 1.5  s       (≈ 0.45m, 给步态启动留余地)
+    WALK_SPEED       = 0.50 m/s     (用户实测, 比 Go2 例子 0.3 快, 但单步距离还是稳的)
+    WALK_DURATION    = 2.0  s       (≈ 1.0m, 用户实测位移符合预期)
     STARTUP_DELAY    = 0.3  s       (开始 move 后, 前 0.3s 不算 WALK_DURATION, 等 R1 进入步态)
     DEBOUNCE_FRAMES  = 6            (跟 main.py 一致)
 
@@ -71,14 +77,13 @@ log = setup_logger("r1.motion")
 # ============================================================
 #  显式参数 (不读 config, 改这里就行)
 # ============================================================
-# 运动参数 (参考 r1/high_level 官方 example 的速度量级)
-WALK_SPEED = 0.30         # m/s, 走两步的线速度 (跟 Go2 high_level 官方例子 0.3 一致)
-WALK_DURATION = 1.5       # 秒, 走两步的持续时间 (≈ 0.45m, R1 单步 ≈ 10-12cm)
+# 运动参数 (用户实测值)
+WALK_SPEED = 0.50         # m/s, 走两步的线速度
+WALK_DURATION = 2.0       # 秒, 走两步的持续时间 (≈ 1.0m, 用户实测)
 STARTUP_DELAY = 0.3       # 秒, 走两步开始后前 0.3s 不算 WALK_DURATION (等 R1 步态真的启动)
 DIAG_EVERY = 0.2          # 秒, 走两步过程中每 0.2s 打一次诊断 log (确认 move 真发了)
 
 # 启动序列时序 (每步切完等一会儿, 让 R1 内部状态稳定)
-ZERO_TORQUE_WAIT = 0.5    # ZeroTorque 后等 0.5s
 DAMP_WAIT = 0.5           # Damp 后等 0.5s (电机被切, 等它软落完)
 STANCE_WAIT = 0.5         # Stance 后等 0.5s
 LOCO_WAIT = 1.0           # Start() 后等 1s (进入 locomotion)
@@ -86,7 +91,7 @@ STANDUP_WAIT = 3.0        # Lie2StandUp 后等 3s (站起动作慢, 大约 2-3s)
 
 # 视觉参数
 DEBOUNCE_FRAMES = 6
-ROI = (0.20, 0.10, 0.60, 0.80)   # 中央 60% × 80% 区域
+ROI = (0.20, 0.05, 0.60, 0.60)   # 中央 60% × 80% 区域
 MIN_HAND_AREA_PCT = 3.0
 MAX_HAND_AREA_PCT = 50.0
 
@@ -103,11 +108,18 @@ class AppState(enum.Enum):
 
 
 # ============================================================
-#  启动序列: 6 步走完整条状态机路径
+#  启动序列: Damp 起手 → 4 步走到站立
 # ============================================================
 def startup_sequence(robot: R1Client) -> bool:
-    """按用户实测的状态序列执行:
-        ZeroTorque (0) → Damp (1) → Stance (4) → Start (811) → Lie2StandUp (701) → 速度=0
+    """按合法状态序列执行:
+        Damp (1) → Stance (4) → Start (811) → Lie2StandUp (701) → 速度=0
+
+    为什么 Damp 起手 (而不是 ZeroTorque)?
+        真实使用场景: 机器人先上电 (R1 上电默认就在 Damp, 电机被切),
+        程序启动时直接 ZeroTorque 会让电机"突然上电但零力矩",
+        腿会"突突"一下砸下来, 容易撞坏关节或摔坏机器人。
+        Damp 起手 → Stance → Start → Lie2StandUp, 电机重新使能的过程
+        是连续可控的 (Stance 锁位置, 不会砸)。
 
     为什么必须按这个顺序? R1 FSM 不是任意两两之间都能切:
       - Stance 模式: 电机锁位置, 不能抗扰动, 不算"真站稳"
@@ -115,42 +127,36 @@ def startup_sequence(robot: R1Client) -> bool:
       - Lie2StandUp: 动画动作, 必须在 Start 模式下才能成功执行
     """
     log.info("=" * 60)
-    log.info("启动序列: ZeroTorque → Damp → Stance → Start → Lie2StandUp → 速度=0")
+    log.info("启动序列: Damp → Stance → Start → Lie2StandUp → 速度=0")
     log.info("=" * 60)
 
-    # 1) ZeroTorque (FSM 0): 零力矩, 软状态 (你把机器人放倒时它就在这个状态)
-    log.info("[1/6] ZeroTorque()  → FSM 0   (零力矩, 软状态)")
-    robot.zero_torque()
-    time.sleep(ZERO_TORQUE_WAIT)
-    # 绕开后续 exit_locomotion() 的安全门 (zero_torque 后 _known_fsm=ZERO_TORQUE)
-    robot.set_known_fsm(R1FsmState.STAND)
-
-    # 2) Damp (FSM 1): 切断电机 — ⚠️ 这里 force=True 是状态机路径, 不是急停
+    # 1) Damp (FSM 1): 切断电机 — R1 上电默认就在 Damp, 显式切一次保证状态干净
+    #    ⚠️ 这里 force=True 是状态机路径, 不是急停
     #    force=True 才能调, 因为 sdk_client 默认拒绝 damp() (太危险)
-    log.info("[2/6] Damp(force=True)  → FSM 1   (切电机, 状态机路径的一步)")
+    log.info("[1/5] Damp(force=True)  → FSM 1   (切电机, 上电默认状态, 显式确认)")
     robot.damp(force=True)
     time.sleep(DAMP_WAIT)
     # damp() 后 _known_fsm=DAMP, 重置为 STAND 准备下一步
     robot.set_known_fsm(R1FsmState.STAND)
 
-    # 3) Stance (FSM 4): 锁定站立 — 电机锁位置, 但不能抗扰动
-    log.info("[3/6] Stance()  → FSM 4   (锁定站立, 电机锁位置, 不能抗扰动)")
+    # 2) Stance (FSM 4): 锁定站立 — 电机锁位置, 但不能抗扰动
+    log.info("[2/5] Stance()  → FSM 4   (锁定站立, 电机锁位置, 不能抗扰动)")
     robot.balance_stand()  # 内部调 self._loco.Stance()
     time.sleep(STANCE_WAIT)
 
-    # 4) Start (FSM 811): 进入 Locomotion (走跑模式)
-    log.info("[4/6] Start()  → FSM 811 (Locomotion, 走跑模式)")
+    # 3) Start (FSM 811): 进入 Locomotion (走跑模式)
+    log.info("[3/5] Start()  → FSM 811 (Locomotion, 走跑模式)")
     robot.enter_locomotion()
     time.sleep(LOCO_WAIT)
 
-    # 5) Lie2StandUp (FSM 701): 从躺姿站起 — 必须在 Start 模式下才能成功
-    log.info("[5/6] Lie2StandUp()  → FSM 701 (从躺姿站起, 需在 Start 模式下)")
+    # 4) Lie2StandUp (FSM 701): 从躺姿站起 — 必须在 Start 模式下才能成功
+    log.info("[4/5] Lie2StandUp()  → FSM 701 (从躺姿站起, 需在 Start 模式下)")
     robot.stand_up_from_lie()
     log.info(f"       等待 {STANDUP_WAIT}s 让站起动作完成...")
     time.sleep(STANDUP_WAIT)
 
-    # 6) 速度=0 — Start 模式 + 速度=0 = 动态稳定站立
-    log.info("[6/6] move(0, 0, 0)  →  Start 模式 + 速度=0  (动态稳定站立)")
+    # 5) 速度=0 — Start 模式 + 速度=0 = 动态稳定站立
+    log.info("[5/5] move(0, 0, 0)  →  Start 模式 + 速度=0  (动态稳定站立)")
     robot.move(0.0, 0.0, 0.0)
 
     log.info("=" * 60)
