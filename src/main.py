@@ -7,6 +7,13 @@
     张开手掌 5 指 (STOP)   →  exit_locomotion()   → R1 回 Stance (FSM 4)
     握起拳头    (BACKWARD) →  damp(force=True)    → R1 切 Damp (FSM 1) 切断电机
 
+⚠️ **STOP → Stance 仅在挂着调试时安全, 脱挂运行会倒** ⚠️
+    R1 的 Stance (FSM 4) 本质是电机锁位置/力矩保持站立姿势, **不**做动态平衡。
+    没挂住时, 任何外部扰动 (气流、地板不平、轻微推一下) 都会让 R1 自己倒下。
+    真正"站稳"是 Start (FSM 811) + 速度=0 (走跑控制器在线 + 动态平衡)。
+    本程序默认挂在支架上跑, 所以 STOP 切 Stance 是 OK 的;
+    如果哪天脱挂跑这个版本, 把 STOP 的 action 改成"保持 Locomotion + 速度=0"再跑。
+
 ⚠️ 关键警告 ⚠️
     damp() 切断 R1 所有电机, 机器人会瘫倒, 必须物理 power cycle 才能恢复。
     1. 跑这个版本前, 把机器人固定在支架上, 周围留 1m 空间
@@ -306,11 +313,18 @@ def main() -> int:
         log.exception(f"主循环异常: {e}")
         return 2
     finally:
-        # 关键: 退出时机器人回到 Stance
+        # 关键: 安全退出 = 保持在 Start (FSM 811) + 速度=0 = 动态稳定站立
+        # 不能切 Stance (FSM 4), 因为 Stance 是电机锁位置, R1 在该模式下不能抗扰动,
+        # 一推就倒。Start + 速度=0 走的是动态平衡控制, 真正"站稳"。
+        # 详细对比见 main_motion.py 顶部注释。
         try:
-            if not robot.is_dry_run and will_enter_loco:
-                log.info("退出时让 R1 回到 Stance...")
-                robot.exit_locomotion()
+            if robot.is_dry_run:
+                log.info("安全退出: [DRY-RUN] 跳过 stop_move() (未连真实 R1)")
+            elif not will_enter_loco:
+                log.info("安全退出: 机器人未进 locomotion (safe-mode), 保持 Stance 不动")
+            else:
+                log.info("安全退出: 速度清零, 保持 Start 模式 (FSM 811) — 动态稳定站立")
+                robot.stop_move()
         except Exception:  # noqa: BLE001
             pass
         try:

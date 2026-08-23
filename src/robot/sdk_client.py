@@ -273,6 +273,11 @@ class _RealR1Client:
     def exit_locomotion(self) -> None:
         """退出 locomotion: 先停速度, 再回 stance (FSM 4)。
 
+        ⚠️ **不要** 把这个方法当 safe-exit 用!
+        R1 的 Stance (FSM 4) 是电机锁位置, **不能抗扰动**, 一推就倒。
+        真正"站稳"是 Start (FSM 811) + 速度=0 (动态平衡控制)。
+        程序退出时 (finally 块) 调 stop_move() 即可, 不要调这个。
+
         ⚠️ 安全门: 如果我们本地跟踪到 R1 在 ZERO_TORQUE 模式 (FSM 0), 拒绝发
         Stance() — ZERO_TORQUE 状态下 R1 电机零力矩, 软件方式不能直接切到
         Stance (R1 端会进未定义状态), 只能 power cycle 恢复。
@@ -470,8 +475,8 @@ class _RealR1Client:
         """清理客户端状态。**不**主动给 R1 发任何指令 (避免关进程时 segfault)。
 
         想要停机器人, 显式调:
-            - stop_move()         # 速度清零 (FSM 811 下生效)
-            - exit_locomotion()   # Stance (FSM 4) 完整退出
+            - stop_move()         # 速度清零 (FSM 811 下生效) — ✅ 推荐用于 safe-exit
+            - exit_locomotion()   # Stance (FSM 4) — ⚠️ R1 在 Stance 不能抗扰动, 不推荐
             - damp()              # 急停, 切断电机
 
         还会调用 ChannelFactory.Finalize() (如果 SDK 暴露了的话) — 把 DDS

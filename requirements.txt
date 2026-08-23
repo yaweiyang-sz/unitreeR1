@@ -11,7 +11,7 @@ PyYAML>=6.0
 # MediaPipe 在 aarch64 上的官方预编译轮子 Google 最高发到 0.10.9 (0.10.10+ 只发 x86_64)。
 # 0.10.9 的 mp.solutions.hands / mp.solutions.pose API 与 0.10.18 完全一致, 够用。
 # 0.10.9 也是 aarch64 + Python 3.8 上 pip 能装到的最后版本。
-mediapipe==0.10.30
+mediapipe==0.10.18
 
 # 宇树 SDK（源码安装；这里仅占位）
 # pip3 install -e /opt/unitree_sdk2_python

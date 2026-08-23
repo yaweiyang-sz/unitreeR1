@@ -366,18 +366,22 @@ def main() -> int:
         state = AppState.ERROR
         return 2
     finally:
-        # 退出: 停速度 + 退回 Stance
+        # 退出: 速度清零, 保持 Start (FSM 811) 模式
+        # 不能切 Stance (FSM 4), 原因见模块顶部注释:
+        #   - Stance: 电机锁位置, R1 不能抗扰动, 一推就倒
+        #   - Start + 速度=0: 动态平衡控制, 真正"站稳"
+        # 同时 arm 任务 (WaveHand / ShakeHand) 的前置条件就是 Start 模式 + 速度=0,
+        # 切到 Stance 后再回 Start 又要重走 ZeroTorque→Damp→Stance→Start 序列, 没必要。
+        # log 永远打 (dry-run 也打), 让用户能确认 finally 跑过了
         try:
-            if not robot.is_dry_run:
-                log.info("退出中: 停速度 + 退回 Stance (FSM 4)")
-                try:
-                    robot.stop_move()
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    robot.exit_locomotion()
-                except Exception:  # noqa: BLE001
-                    pass
+            if robot.is_dry_run:
+                log.info("安全退出: [DRY-RUN] stop_move() 走模拟路径")
+            else:
+                log.info("安全退出: 速度清零, 保持 Start 模式 (FSM 811) — 动态稳定站立")
+            try:
+                robot.stop_move()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             pass
         try:
