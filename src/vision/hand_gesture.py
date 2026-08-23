@@ -1,8 +1,8 @@
 """手势识别: MediaPipe Hands 21 关键点 -> 5 类动作。
 
-判定方案（v2, 2026-08）:
+判定方案（v3, 2026-08）:
     STOP      ✋  5 指全展开 + 手腕水平速度 < 阈值（手保持不动）
-    FORWARD   ☝️  食指单独竖起（其余弯曲）
+    FORWARD   ✌️  食指+中指同时竖起（无名指+小指弯曲）
     BACKWARD  ✊  拳头（5 指全弯）
     LEFT      ✋  5 指全展开 + 手腕水平向左挥动（vx < -thresh）
     RIGHT     ✋  5 指全展开 + 手腕水平向右挥动（vx >  thresh）
@@ -369,17 +369,17 @@ def _classify_gesture(
     wrist_vx: float = 0.0,
     speed_thresh: float = 150.0,
 ) -> tuple[Gesture, float]:
-    """根据 5 指 ratio + 手腕水平速度分类手势 (v2.2).
+    """根据 5 指 ratio + 手腕水平速度分类手势 (v3, 2026-08).
 
     阈值策略:
-        弯曲 ratio < 1.2   (握拳时 ratio 0.4-1.0, 阈值 1.2 容许半握)
+        弯曲 ratio < 1.3   (握拳时 ratio 0.4-1.0, 阈值 1.3 容许半握)
         伸直 ratio > 1.65  (激活态要求 5 指都明显伸直)
-        食指伸出 ratio > 1.4 (FORWARD 阈值, 比 1.65 宽松, 让用户能稍微弯其它手指)
+        食指/中指伸出 ratio > 1.4 (FORWARD 阈值, 比 1.65 宽松, 让用户稍微弯其它手指)
         拇指: 弯曲/伸直临界值 1.3, 但 BACKWARD 不依赖拇指 (握拳时拇指可能稍微伸)
 
     判定顺序:
-        1. 4 指 (食/中/无/小) 都 < 1.2      -> BACKWARD (拳头, 拇指不参与)
-        2. 食指 > 1.4 + 中/无/小 都 < 1.2  -> FORWARD (拇指不参与)
+        1. 4 指 (食/中/无/小) 都 < 1.3      -> BACKWARD (拳头, 拇指不参与)
+        2. 食指 > 1.4 + 中指 > 1.4 + 无/小 都 < 1.3  -> FORWARD (拇指不参与, v3 起改双指)
         3. 5 指全张 (拇>1.3, 其他>1.65)    -> 激活态: 挥动决定 LEFT/RIGHT/STOP
         4. 其他 -> UNKNOWN
     """
@@ -391,7 +391,7 @@ def _classify_gesture(
 
     # 弯曲阈值 (容许半握: 完全握拳 ~0.5, 半握 ~1.0, 卡 1.3 让小指半伸也能识别)
     BENT = 1.3
-    # 食指伸直阈值 (比激活态的 1.65 宽松, 让用户稍微弯其它手指也能识别)
+    # 食指/中指伸直阈值 (比激活态的 1.65 宽松, 让用户稍微弯其它手指也能识别)
     INDEX_OUT = 1.4
     # 激活态伸直阈值 (要求 5 指都明显伸直)
     FULL_EXT = 1.65
@@ -402,8 +402,9 @@ def _classify_gesture(
     if ri < BENT and rm < BENT and rr < BENT and rp < BENT:
         return Gesture.BACKWARD, 0.95
 
-    # 2) 食指伸出 + 中/无/小 弯曲 -> FORWARD (拇指不参与)
-    if ri > INDEX_OUT and rm < BENT and rr < BENT and rp < BENT:
+    # 2) 食指+中指 同时伸出, 无名指+小指弯曲 -> FORWARD (拇指不参与)
+    #    v3 改成双指: 单指容易被误识别 (尤其远处小手掌), V 字手势更稳定
+    if ri > INDEX_OUT and rm > INDEX_OUT and rr < BENT and rp < BENT:
         return Gesture.FORWARD, 0.95
 
     # 3) 5 指全张 -> 激活态: 用挥动方向判定

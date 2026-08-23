@@ -31,10 +31,15 @@ main.py 留作只切状态/不发速度的安全版本, 本程序加上"走两�
 == 手势 → 运动 (走两步, 速度/时长都显式写死, 不读 config) ==
     ✊  拳头 (BACKWARD) → 机器人向后走两步  (vx = -0.50 m/s × 2.0s)
     ✋  手掌 (STOP)     → 原地站住           (vx=0, vy=0, vyaw=0, 保持 Locomotion)
-    ☝️  食指 (FORWARD)  → 机器人向前走两步  (vx = +0.50 m/s × 2.0s)
+    ✌️  食+中指 (FORWARD) → 机器人向前走两步  (vx = +0.50 m/s × 2.0s)
+
+    ⚠️ FORWARD 用 V 字手势 (食指+中指) 而不是单指, 原因:
+        单指(☝️)在远处小手掌下容易误识别为 BACKWARD (5 指都弯一点点, 只食指伸出),
+        双指(✌️)形状更明确, 抗干扰更强。
+        改 v3: 2026-08 — 详见 src/vision/hand_gesture.py _classify_gesture
 
     ⚠️ 防连续: 一次前进/后退完成后, 必须中间出现一次 STOP 才能再做下一次前进/后退。
-                防止用户"拳头 → 食指" 或 "食指 → 拳头" 连续触发。
+                防止用户"拳头 → V字" 或 "V字 → 拳头" 连续触发。
 
 == 显式参数 (顶部, 调这里) ==
     WALK_SPEED       = 0.50 m/s     (用户实测, 比 Go2 例子 0.3 快, 但单步距离还是稳的)
@@ -302,6 +307,9 @@ def draw_hud(
     last_motion: Optional[Gesture],
     info: str,
     fingers_state: Optional[dict],
+    roi_pcts: Optional[tuple] = None,        # (x, y, w, h) 0~1, None=不画 ROI
+    hand_pos: Optional[tuple] = None,        # (cx, cy) 像素, None=不画手位置
+    hand_in_roi: Optional[bool] = None,      # True/False/None (None=灰)
 ):
     h, w = frame.shape[:2]
     # 顶部黑条
@@ -320,9 +328,59 @@ def draw_hud(
     cv2.putText(frame, f"Last motion: {last_str}", (10, 84),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     # 底部图例
-    legend = "[拳=后退两步]  [掌=停]  [食指=前进两步]  [q/ESC=退出]"
+    legend = "[拳=后退两步]  [掌=停]  [食+中指=前进两步]  [q/ESC=退出]"
     cv2.putText(frame, legend, (10, h - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+    # ROI 识别区 (画在 HUD 之上, 让用户清楚知道手该放在哪儿)
+    if roi_pcts is not None:
+        x_pct, y_pct, w_pct, h_pct = roi_pcts
+        rx = int(w * x_pct)
+        ry = int(h * y_pct)
+        rw = int(w * w_pct)
+        rh = int(h * h_pct)
+        # 1) 半透明绿色填充
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), -1)
+        cv2.addWeighted(overlay, 0.06, frame, 0.94, 0, frame)
+        # 2) 绿色边框
+        cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
+        # 3) 黄色取景角
+        corner = 22
+        thick = 3
+        yellow = (0, 255, 255)
+        # top-left
+        cv2.line(frame, (rx, ry), (rx + corner, ry), yellow, thick)
+        cv2.line(frame, (rx, ry), (rx, ry + corner), yellow, thick)
+        # top-right
+        cv2.line(frame, (rx + rw, ry), (rx + rw - corner, ry), yellow, thick)
+        cv2.line(frame, (rx + rw, ry), (rx + rw, ry + corner), yellow, thick)
+        # bottom-left
+        cv2.line(frame, (rx, ry + rh), (rx + corner, ry + rh), yellow, thick)
+        cv2.line(frame, (rx, ry + rh), (rx, ry + rh - corner), yellow, thick)
+        # bottom-right
+        cv2.line(frame, (rx + rw, ry + rh), (rx + rw - corner, ry + rh), yellow, thick)
+        cv2.line(frame, (rx + rw, ry + rh), (rx + rw, ry + rh - corner), yellow, thick)
+        # 4) 顶部 label "RECOGNITION AREA" (被黑条挡了就显示在 ROI 内顶部)
+        label = "RECOGNITION AREA"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        label_x = rx + (rw - tw) // 2
+        label_y = max(ry + th + 4, 100)  # 避开顶部 90px 黑条
+        cv2.rectangle(frame, (label_x - 4, label_y - th - 4),
+                      (label_x + tw + 4, label_y + 4), (0, 0, 0), -1)
+        cv2.putText(frame, label, (label_x, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, yellow, 1)
+        # 5) 手位置标记 (小圆 + 状态色)
+        if hand_pos is not None:
+            cx, cy = hand_pos
+            if hand_in_roi is None:
+                color = (200, 200, 200)
+            elif hand_in_roi:
+                color = (0, 255, 0)
+            else:
+                color = (0, 0, 255)
+            cv2.circle(frame, (cx, cy), 8, color, 2)
+            cv2.circle(frame, (cx, cy), 3, color, -1)
 
 
 # ============================================================
@@ -402,6 +460,19 @@ def main() -> int:
 
             # 4) 显示
             if not args.no_window:
+                # 手位置: 在 ROI 内/外/未知
+                hand_pos = gr.hand_center if gr else None
+                in_roi: Optional[bool]
+                if gr is None or hand_pos is None:
+                    in_roi = None
+                else:
+                    fh, fw = frame.shape[:2]
+                    rx = int(fw * ROI[0])
+                    ry = int(fh * ROI[1])
+                    rw = int(fw * ROI[2])
+                    rh = int(fh * ROI[3])
+                    cx, cy = hand_pos
+                    in_roi = (rx <= cx <= rx + rw) and (ry <= cy <= ry + rh)
                 draw_hud(
                     frame,
                     gesture=stable,
@@ -409,6 +480,9 @@ def main() -> int:
                     last_motion=motion.last_motion,
                     info=info,
                     fingers_state=gr.fingers_state if gr else None,
+                    roi_pcts=ROI,
+                    hand_pos=hand_pos,
+                    hand_in_roi=in_roi,
                 )
                 cv2.imshow("R1 Motion Control", frame)
                 key = cv2.waitKey(30) & 0xFF
